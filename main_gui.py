@@ -67,12 +67,14 @@ def crop_standard(img, box):
 # ==========================================
 # MULTIPROCESSING INFERENCE PROCESS
 # ==========================================
-def inference_worker(inf_queue, res_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
+def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
     """
-    Subprocess handling YOLO ML Pipeline directly assigned per Camera.
+    Highly Decoupled Inference Worker.
+    Optimized: NEVER sends the massive NumPy frames back.
+    Only dispatches lightweight (frame_id, boxes, ids, names_dict) metadata tuple back enabling extreme CPU savings.
     """
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print(f"[ML PROCESS | {cam_name}] Initializing on {device}...")
+    print(f"[ML PROCESS | {cam_name}] Initializing strictly on {device}...")
     
     try:
         yolo_model = YOLO('yolov8n-face.pt', task='detect')
@@ -106,50 +108,35 @@ def inference_worker(inf_queue, res_queue, ann_queue, cmd_queue, timestamp_str, 
     archived_tracks = {}
     track_identities = {}
 
-    print(f"[ML PROCESS | {cam_name}] Ready and listening for frames...")
+    print(f"[ML PROCESS | {cam_name}] Ready and listening for inbound arrays...")
 
     while True:
         try:
             cmd = cmd_queue.get_nowait()
             if cmd == 'STOP': break
+        except queue.Empty: pass
+
+        try:
+            # We enforce standard sequential pulls natively (No drops here because Watchdog Reader handled skips already securely)
+            item = inf_queue.get(timeout=0.2)
         except queue.Empty:
-            pass
-
-        # === THE FRAME-PADDING FIX ===
-        frame, input_fps = None, None
-        dropped_count = 0
+            continue
+            
+        frame_id, frame, skipped_frames = item
+        # Fast-Forward virtual frames alive bounds natively corresponding to exact duplicate drops!
+        frame_count += (skipped_frames + 1)
         
-        # Drain the inference queue. By calculating 'dropped_count', we know exactly how many duplicate frames need padding to retain explicit real-time 30 FPS video duration bounding outputs.
-        while not inf_queue.empty():
-            try:
-                frame, input_fps = inf_queue.get_nowait()
-                dropped_count += 1
-            except queue.Empty:
-                break
-                
-        # Wait cleanly if no frames exist
-        if frame is None:
-            try:
-                frame, input_fps = inf_queue.get(timeout=0.05)
-                dropped_count = 1
-            except queue.Empty:
-                continue
-                
-        fps = input_fps if input_fps > 0 else 30
-        frame_count += dropped_count 
+        boxes = []
+        ids = []
+        dict_names = {}
 
-        display_frame = frame.copy()
-        current_active_faces = 0
-
-        # Run Heavy Matrix Calculations
         if index is not None and len(target_names) > 0:
-            results = yolo_model.track(display_frame, persist=True, tracker="bytetrack.yaml", verbose=False)
+            results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
             has_detections = results[0].boxes.id is not None
             
             if has_detections:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 ids = results[0].boxes.id.int().cpu().numpy()
-                current_active_faces = len(ids)
                 
                 for t_id in ids:
                     if t_id not in active_track_memory:
@@ -157,10 +144,11 @@ def inference_worker(inf_queue, res_queue, ann_queue, cmd_queue, timestamp_str, 
                             'start_time': format_timestamp(frame_count, fps),
                             'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0
                         }
-                    # Append aggregate of missing frames to track correctly
-                    active_track_memory[t_id]['frames_alive'] += dropped_count
+                    # Fast-forward exact skips compensating track retention 
+                    active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
 
-                if frame_count % FRAME_SKIP == 0:
+                # Vector Operations
+                if frame_count % FRAME_SKIP == 0 or (frame_count - skipped_frames) % FRAME_SKIP == 0:
                     batch_tensors, batch_track_ids = [], []
                     for i, t_id in enumerate(ids):
                         crop = crop_standard(frame, boxes[i])
@@ -186,38 +174,29 @@ def inference_worker(inf_queue, res_queue, ann_queue, cmd_queue, timestamp_str, 
                                 track_identities[t_id] = winner
                                 active_track_memory[t_id]['buffer'] = []
 
-                # Draw Visual Output Layers
+                # Compile Output Map
                 for i in range(len(ids)):
                     t_id = ids[i]
-                    box = boxes[i]
-                    name = track_identities.get(t_id, "Analyzing...")
-                    color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
-                    cv2.rectangle(display_frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-                    cv2.putText(display_frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    dict_names[t_id] = track_identities.get(t_id, "Analyzing...")
 
-                # Prune Dead Tags
+                # Clean Pruning Algorithms tracking accurate missing frame drops 
                 alive_ids = set(ids)
                 for t_id in list(active_track_memory.keys()):
                     if t_id not in alive_ids:
-                        active_track_memory[t_id]['missing_frames'] += dropped_count
+                        active_track_memory[t_id]['missing_frames'] += (skipped_frames + 1)
                         if active_track_memory[t_id]['missing_frames'] > 15:
                             archived_tracks[t_id] = active_track_memory.pop(t_id)
                     else:
                         active_track_memory[t_id]['missing_frames'] = 0
 
-        # Redirect Output Vectors Appropriately
-        # Sent directly to annotated writer queuing with duplicate dropped_count attached. 
-        if not ann_queue.full():
-            ann_queue.put_nowait((display_frame, fps, dropped_count))
-            
-        # Push real-time snapshot visual UI (We don't need duplicate counts rendered computationally to UI)
+        # Dispatches minimal footprint Metadata block saving massive CPU Serialization bottlenecks 
         if not res_queue.full():
-            res_queue.put_nowait((display_frame, current_active_faces, fps))
+            res_queue.put_nowait((frame_id, boxes, ids, dict_names))
 
     # ==========================
-    # FINAL ATTENDANCE SECURE DUMP
+    # CLOSING SAVE 
     # ==========================
-    print(f"[ML PROCESS | {cam_name}] Shutting down natively... Generating Log Checkboxes.")
+    print(f"[ML PROCESS | {cam_name}] Shutting down. Generating Final Logs.")
     final_mem = {**archived_tracks, **active_track_memory}
     debug_data = []
     student_presence = {name: False for name in target_names}
@@ -255,76 +234,128 @@ def inference_worker(inf_queue, res_queue, ann_queue, cmd_queue, timestamp_str, 
     pd.DataFrame(debug_data).to_csv(os.path.join(RESULTS_DIR, f"{timestamp_str}_{cam_name}_DEBUG_Tracks.csv"))
     output_data = [{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent', 'Detection Count': student_detection_count[s]} for s in target_names]
     pd.DataFrame(output_data).to_csv(os.path.join(RESULTS_DIR, f"{timestamp_str}_{cam_name}_output.csv"), index=False)
-    print(f"[ML PROCESS | {cam_name}] Clean completion saving.")
 
 
 # ==========================================
-# DECOUPLED I/O WORKER THREADS
+# BACKGROUND WORKER THREADS (MAIN PROCESS I/O ISOLATION)
 # ==========================================
-def rstp_reader(ip, running_event, raw_queue, inf_queue):
-    """ Absolute Watchdog connecting safely. Sends dropped_count=1 consistently to raw arrays. """
+def rstp_reader(ip, running_event, raw_queue, inf_queue, draw_queue):
+    """ RTSP loop evaluating extreme skip conditions safely without blocking native bounds. """
     url = f"rtsp://{USERNAME}:{PASSWORD}@{ip}:554/stream1"
     cap = None
+    skipped_frames = 0
+    frame_id = 0
+    
     while running_event.is_set():
         if cap is None or not cap.isOpened():
-            print(f"[*] Native Reader Booting IP {ip}...")
             cap = cv2.VideoCapture(url)
             if not cap.isOpened():
-                print(f"[-] Dropped Feed {ip}. Retrying Watchdog timer natively (5s).")
                 time.sleep(5)
                 continue
             
         ret, frame = cap.read()
         if not ret:
-            print(f"[-] Packet dropped for IP {ip}. Reloading Native Object Binding.")
-            cap.release()
-            cap = None
-            continue
+            cap.release(); cap = None; continue
             
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         if fps <= 0: fps = 30
         
-        # Dispatch raw vector -> Assumes total frames exactly pulled consecutively. Padding drop count strictly=1
+        # Immediate RAW dispatch without bottlenecks. If backend disk stalls, throw immediately. 
         if not raw_queue.full():
             raw_queue.put_nowait((frame, fps, 1))
             
-        # Dispatch ML logic natively 
-        if not inf_queue.full():
-            inf_queue.put_nowait((frame, fps))
+        # CPU Safe ML Inference Control
+        # Bypasses frame logic safely holding counts mapping duplicates exact correctly toward padding 
+        if not inf_queue.full() and not draw_queue.full():
+            # Send cross-process 
+            inf_queue.put_nowait((frame_id, frame, skipped_frames))
+            
+            # Send locally strictly referencing memory pointers (Ultra low overhead)
+            draw_queue.put_nowait((frame_id, frame, skipped_frames, fps))
+            
+            skipped_frames = 0
+            frame_id += 1
+        else:
+            skipped_frames += 1
                 
     if cap:
         cap.release()
 
-def writer_worker(queue_obj, output_path, running_event):
-    """ 
-    Generic highly decoupled writer thread executing loop based duplicate frame padding 
-    to absolutely bypass the 'sped up' phenomenon natively. 
-    """
+
+def raw_writer_worker(queue_obj, output_path, running_event):
     writer = None
     while True:
         try:
             item = queue_obj.get(timeout=0.2)
-            if item is None: # Sentinel Check Shutdown Hook
-                break
-            frame, input_fps, dropped_count = item
+            if item is None: break
+            frame, input_fps, duplicates = item
             
             if writer is None:
                 h, w = frame.shape[:2]
                 fps = input_fps if input_fps > 0 else 30
                 writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                 
-            # DUPLICATE PADDING FRAME LOGIC RESOLVING TIME DRIFTS!
-            for _ in range(dropped_count):
+            for _ in range(duplicates):
                 writer.write(frame)
+        except queue.Empty:
+            if not running_event.is_set() and queue_obj.empty(): break
+    if writer: writer.release()
+
+
+def ann_writer_worker(draw_queue, res_queue, ui_queue, output_path, running_event):
+    """
+    Decoupled Drawing Writer Pipeline.
+    Merges local raw pointers combining safely extracted cross-process metadata independently resolving extreme CPU limits.
+    """
+    writer = None
+    while True:
+        try:
+            item = draw_queue.get(timeout=0.2)
+            if item is None: break
+            frame_id, frame, skipped_frames, input_fps = item
+            
+            # Sync Wait isolating Metadata returned accurately mapped to Frame ID
+            meta = None
+            while running_event.is_set():
+                try:
+                    m = res_queue.get(timeout=0.1)
+                    if m[0] == frame_id:
+                        meta = m
+                        break
+                except queue.Empty:
+                    pass
+                    
+            if meta is None or not running_event.is_set(): break
+            
+            _, boxes, ids, dict_names = meta
+            active_faces = len(ids) if ids is not None else 0
+            
+            draw_frame = frame.copy()
+            for i in range(len(ids)):
+                t_id = ids[i]
+                box = boxes[i]
+                name = dict_names.get(t_id, "Analyzing...")
+                color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
+                cv2.rectangle(draw_frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                cv2.putText(draw_frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+            if writer is None:
+                h, w = draw_frame.shape[:2]
+                fps = input_fps if input_fps > 0 else 30
+                writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                
+            # EXECUTE FRAME PADDING AVOIDING SPED UP PHENOMENON
+            for _ in range(skipped_frames + 1):
+                writer.write(draw_frame)
+                
+            if not ui_queue.full():
+                ui_queue.put_nowait((draw_frame, active_faces))
                 
         except queue.Empty:
-            if not running_event.is_set() and queue_obj.empty():
-                break
-                
-    if writer:
-        writer.release()
-    print(f"[*] Released video bounds reliably saved to: {output_path}")
-
+            if not running_event.is_set() and draw_queue.empty(): break
+            
+    if writer: writer.release()
+    print(f"[*] Released Annotated Sequence: {output_path}")
 
 # ==========================================
 # MAIN DESKTOP GUI
@@ -332,7 +363,7 @@ def writer_worker(queue_obj, output_path, running_event):
 class AttendanceApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Real-Time Dual-Process YOLO Tracking Array")
+        self.title("Real-Time Dual-Process Optimized Architecture")
         self.geometry("1400x850")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -345,28 +376,23 @@ class AttendanceApp(ctk.CTk):
         self.sys_fps = 0
         self.last_fps_time = time.perf_counter()
         self.frames_rendered = 0
-        
-        # Telemetry Cache
         self.cam1_active_faces = 0
         self.cam2_active_faces = 0
 
         self.setup_ui()
 
     def setup_ui(self):
-        # Master Sidebar Layout
         self.sidebar_frame = ctk.CTkFrame(self, width=320, corner_radius=0)
         self.sidebar_frame.pack(side="left", fill="y", padx=0, pady=0)
         
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Attendance Core ML", font=ctk.CTkFont(size=22, weight="bold"))
         self.logo_label.pack(pady=20, padx=20)
         
-        # Visual View Toggle Mechanism
         self.view_label = ctk.CTkLabel(self.sidebar_frame, text="Active Telemetry View:", font=ctk.CTkFont(size=14, underline=True))
         self.view_label.pack(pady=(10,0), padx=20, anchor="w")
         self.view_toggle = ctk.CTkSegmentedButton(self.sidebar_frame, values=["Camera 1", "Camera 2"], variable=self.view_target)
         self.view_toggle.pack(pady=10, padx=20, fill="x")
         
-        # Protocol
         self.protocol_label = ctk.CTkLabel(self.sidebar_frame, text="Execution Iteration:")
         self.protocol_label.pack(pady=(15,0), padx=20, anchor="w")
         for p, info in PROTOCOLS.items():
@@ -380,7 +406,6 @@ class AttendanceApp(ctk.CTk):
         self.stop_btn.pack(pady=10, padx=20)
         self.stop_btn.configure(state="disabled")
         
-        # Live System Telemetry Section
         self.telemetry_lbl = ctk.CTkLabel(self.sidebar_frame, text="Live Telemetry Overlay", font=ctk.CTkFont(size=18, weight="bold"))
         self.telemetry_lbl.pack(pady=(40,10), padx=20, anchor="w")
 
@@ -391,111 +416,84 @@ class AttendanceApp(ctk.CTk):
         self.faces_lbl = ctk.CTkLabel(self.sidebar_frame, text="Target Faces Detected: 0", font=ctk.CTkFont(size=14))
         self.faces_lbl.pack(pady=5, padx=20, anchor="w")
 
-        # Visual Image Renderer Layout natively tracking bounds securely
         self.video_frame = ctk.CTkLabel(self, text="Camera ML Feed Offline", bg_color="gray", width=950, height=750)
         self.video_frame.pack(side="right", fill="both", expand=True, padx=20, pady=20)
 
     def start_tracking(self):
-        if self.running_event.is_set():
-            return
+        if self.running_event.is_set(): return
             
         self.running_event.set()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         
         sel = self.selected_protocol.get()
-        protocol_info = PROTOCOLS[sel]
+        p_info = PROTOCOLS[sel]
         
-        total_time_cam1 = len(CAM1_PRESETS) * (protocol_info['cam1'] + 5)
-        total_time_cam2 = len(CAM2_PRESETS) * (protocol_info['cam2'] + 5)
-        total_sweep_time = max(total_time_cam1, total_time_cam2)
-        
-        self.t_end = time.perf_counter() + total_sweep_time
+        total_time_cam1 = len(CAM1_PRESETS) * (p_info['cam1'] + 5)
+        total_time_cam2 = len(CAM2_PRESETS) * (p_info['cam2'] + 5)
+        self.t_end = time.perf_counter() + max(total_time_cam1, total_time_cam2)
 
         timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # === System Global Architecture ===
-        
-        # Cam 1 Queues
+        # CROSS PROCESS QUEUES
         self.cam1_inf_q = mp.Queue(maxsize=30)
         self.cam1_res_q = mp.Queue(maxsize=30)
-        self.cam1_ann_q = mp.Queue(maxsize=150)
-        self.cam1_raw_q = queue.Queue(maxsize=150)
         self.cam1_cmd_q = mp.Queue()
         
-        # Cam 2 Queues
         self.cam2_inf_q = mp.Queue(maxsize=30)
         self.cam2_res_q = mp.Queue(maxsize=30)
-        self.cam2_ann_q = mp.Queue(maxsize=150)
-        self.cam2_raw_q = queue.Queue(maxsize=150)
         self.cam2_cmd_q = mp.Queue()
-
-        # 1. Fire DUAL Multiprocessing Inference Process Array (True Multiple Cores Mapping)
-        self.ml_proc1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_res_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
-        self.ml_proc2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_res_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
         
-        self.ml_proc1.daemon = True
-        self.ml_proc2.daemon = True
-        self.ml_proc1.start()
-        self.ml_proc2.start()
+        # INTERNAL THREAD QUEUES
+        self.cam1_draw_q = queue.Queue(maxsize=60)
+        self.cam1_raw_q = queue.Queue(maxsize=60)
+        self.cam1_ui_q = queue.Queue(maxsize=30)
+        
+        self.cam2_draw_q = queue.Queue(maxsize=60)
+        self.cam2_raw_q = queue.Queue(maxsize=60)
+        self.cam2_ui_q = queue.Queue(maxsize=30)
 
-        # 2. Fire Decoupled Storage Logic containing exact duplicate frame pads seamlessly preventing video gaps
-        self.writers_pool = [
-            threading.Thread(target=writer_worker, args=(self.cam1_raw_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event)),
-            threading.Thread(target=writer_worker, args=(self.cam2_raw_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event)),
-            threading.Thread(target=writer_worker, args=(self.cam1_ann_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)),
-            threading.Thread(target=writer_worker, args=(self.cam2_ann_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event))
+        # 1. Fire Multiprocessing Isolated CPU/GPU Enclaves
+        self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_res_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
+        self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_res_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
+        self.ml_p1.daemon = True; self.ml_p1.start()
+        self.ml_p2.daemon = True; self.ml_p2.start()
+
+        # 2. Fire Independent Light-Weight I/O Sinks
+        self.threads = [
+            threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event)),
+            threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event)),
+            threading.Thread(target=ann_writer_worker, args=(self.cam1_draw_q, self.cam1_res_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)),
+            threading.Thread(target=ann_writer_worker, args=(self.cam2_draw_q, self.cam2_res_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)),
+            threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.cam1_draw_q)),
+            threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.cam2_draw_q)),
+            threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, CAM1_PRESETS, p_info['cam1'])),
+            threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, CAM2_PRESETS, p_info['cam2']))
         ]
-        for w in self.writers_pool:
-            w.start()
-
-        # 3. Fire Continuous Network Scrapers pulling exactly mapped stream architectures 
-        self.readers_pool = [
-            threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q)),
-            threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q))
-        ]
-        for r in self.readers_pool:
-            r.start()
-
-        # 4. Fire Independent Perf Timed Rotational Anchors 
-        self.ptz1 = threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, CAM1_PRESETS, protocol_info['cam1']))
-        self.ptz2 = threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, CAM2_PRESETS, protocol_info['cam2']))
-        self.ptz1.start()
-        self.ptz2.start()
+        for t in self.threads: t.start()
 
         self.last_fps_time = time.perf_counter()
         self.frames_rendered = 0
-        
-        # Initiate UI Pulse Routine Loops
         self.update_gui_frame()
 
     def stop_tracking(self):
-        if not self.running_event.is_set():
-            return
-            
-        print("\n[*] Initializing Auto-Termination Sequences... ")
-        # Immediately trip boundary boolean isolating future loop generation.
+        if not self.running_event.is_set(): return
+        print("\n[*] Halting Sequences Natively... ")
         self.running_event.clear()
         
-        # Instruct Independent CUDA Process limits natively breaking inference logic cleanly
         self.cam1_cmd_q.put('STOP')
         self.cam2_cmd_q.put('STOP')
         
-        # Propagate cleanly down the pipe securely terminating loops safely dumping Sentinel NONE elements
-        self.cam1_raw_q.put(None)
-        self.cam2_raw_q.put(None)
-        self.cam1_ann_q.put(None)
-        self.cam2_ann_q.put(None)
+        self.cam1_draw_q.put(None); self.cam2_draw_q.put(None)
+        self.cam1_raw_q.put(None); self.cam2_raw_q.put(None)
         
-        # UI Release updates resolving to base state
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        print("[+] Safely concluded stream constraints.")
 
     def ptz_runner(self, ip, presets, duration):
         for preset in presets:
-            if not self.running_event.is_set():
-                break
+            if not self.running_event.is_set(): break
             url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&{preset}"
             try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=5)
             except: pass
@@ -504,21 +502,16 @@ class AttendanceApp(ctk.CTk):
             while self.running_event.is_set() and (time.perf_counter() - t_mechanical) < 5.0:
                 time.sleep(0.1)
                 
-            if not self.running_event.is_set():
-                break
-            
             t_start = time.perf_counter()
             while self.running_event.is_set() and (time.perf_counter() - t_start) < duration:
                 time.sleep(0.1)
 
     def update_gui_frame(self):
-        """ Render Logic Pull Sequence dynamically resolving exact toggled stream targets. """
         if not self.running_event.is_set():
             self.video_frame.configure(image=None, text="Camera ML Feed Offline")
             return
             
         try:
-            # Check Master Timings securely verifying boundaries
             now = time.perf_counter()
             remaining = max(0, int(self.t_end - now))
             
@@ -530,38 +523,30 @@ class AttendanceApp(ctk.CTk):
             m, s = divmod(rem, 60)
             self.time_lbl.configure(text=f"Time Remaining: {h:02d}:{m:02d}:{s:02d}")
             
-            # Flush ML Process display queue updates securely tracking frames avoiding GUI lag entirely 
-            frame1, active_faces1 = None, self.cam1_active_faces
-            while not self.cam1_res_q.empty():
+            # Flush Internal UI queues natively mapped 
+            frame1 = None
+            while not self.cam1_ui_q.empty():
                 try: 
-                    res1 = self.cam1_res_q.get_nowait()
-                    frame1, active_faces1, _ = res1
-                    self.cam1_active_faces = active_faces1
+                    res1 = self.cam1_ui_q.get_nowait()
+                    frame1, self.cam1_active_faces = res1
                 except queue.Empty: break
                     
-            frame2, active_faces2 = None, self.cam2_active_faces
-            while not self.cam2_res_q.empty():
+            frame2 = None
+            while not self.cam2_ui_q.empty():
                 try: 
-                    res2 = self.cam2_res_q.get_nowait()
-                    frame2, active_faces2, _ = res2
-                    self.cam2_active_faces = active_faces2
+                    res2 = self.cam2_ui_q.get_nowait()
+                    frame2, self.cam2_active_faces = res2
                 except queue.Empty: break
             
-            # Telemetry Metrics Updates conditionally tracking active user scope
             if (now - self.last_fps_time) >= 1.0:
                 self.sys_fps = self.frames_rendered / (now - self.last_fps_time)
                 self.fps_lbl.configure(text=f"System Render FPS: {self.sys_fps:.1f}")
-                
-                # Dynamic Scope 
                 disp_faces = self.cam1_active_faces if self.view_target.get() == "Camera 1" else self.cam2_active_faces
                 self.faces_lbl.configure(text=f"Target Faces Detected: {disp_faces}")
-                
                 self.frames_rendered = 0
                 self.last_fps_time = now
 
-            # Select Explicit Target Image for CustomTkinter output dynamically toggled by Segmentation button
             target_frame = frame1 if self.view_target.get() == "Camera 1" else frame2
-                    
             if target_frame is not None:
                 self.frames_rendered += 1
                 frame_rgb = cv2.cvtColor(target_frame, cv2.COLOR_BGR2RGB)
@@ -570,11 +555,8 @@ class AttendanceApp(ctk.CTk):
                 self.video_frame.configure(image=imgtk, text="")
                 self.video_frame.image = imgtk
                 
-        except Exception as e:
-            print(f"[GUI ERROR] {e}")
-            
-        finally:
-            self.after(33, self.update_gui_frame)
+        except Exception as e: pass
+        finally: self.after(33, self.update_gui_frame)
 
 if __name__ == "__main__":
     mp.freeze_support()
