@@ -43,7 +43,6 @@ FRAMES_PER_VOTE = 5
 BASE_OUTPUT_DIR = "VIDEOS"
 RESULTS_DIR = os.path.abspath('ATTENDENCE RESULTS/MINE')
 
-# Setup Guardrails
 os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -65,13 +64,12 @@ def crop_standard(img, box):
     return img[y1:y2, x1:x2]
 
 # ==========================================
-# MULTIPROCESSING INFERENCE PROCESS
+# MULTIPROCESSING INFERENCE PROCESS (THROTTLED CPU)
 # ==========================================
-def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
+def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
     """
-    Highly Decoupled Inference Worker.
-    Optimized: NEVER sends the massive NumPy frames back.
-    Only dispatches lightweight (frame_id, boxes, ids, names_dict) metadata tuple back enabling extreme CPU savings.
+    Evaluates ML on throttled inbound frames inherently preventing deadlocks.
+    Writes native annotations directly against duplicate outputs maintaining 1-1 strict bounds flawlessly.
     """
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"[ML PROCESS | {cam_name}] Initializing strictly on {device}...")
@@ -108,7 +106,7 @@ def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
     archived_tracks = {}
     track_identities = {}
 
-    print(f"[ML PROCESS | {cam_name}] Ready and listening for inbound arrays...")
+    print(f"[ML PROCESS | {cam_name}] Ready and listening for inbound throttled streams...")
 
     while True:
         try:
@@ -117,18 +115,18 @@ def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
         except queue.Empty: pass
 
         try:
-            # We enforce standard sequential pulls natively (No drops here because Watchdog Reader handled skips already securely)
             item = inf_queue.get(timeout=0.2)
         except queue.Empty:
             continue
             
-        frame_id, frame, skipped_frames = item
-        # Fast-Forward virtual frames alive bounds natively corresponding to exact duplicate drops!
-        frame_count += (skipped_frames + 1)
+        frame, input_fps, skipped_frames = item
         
-        boxes = []
-        ids = []
-        dict_names = {}
+        frame_count += (skipped_frames + 1)
+        fps = input_fps if input_fps > 0 else 30
+        
+        # Deadlock Elimination: Frame is drawn explicitly without sync-queue loops globally limiting logic
+        display_frame = frame.copy()
+        current_active_faces = 0
 
         if index is not None and len(target_names) > 0:
             results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
@@ -137,6 +135,7 @@ def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
             if has_detections:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 ids = results[0].boxes.id.int().cpu().numpy()
+                current_active_faces = len(ids)
                 
                 for t_id in ids:
                     if t_id not in active_track_memory:
@@ -144,10 +143,8 @@ def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
                             'start_time': format_timestamp(frame_count, fps),
                             'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0
                         }
-                    # Fast-forward exact skips compensating track retention 
                     active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
 
-                # Vector Operations
                 if frame_count % FRAME_SKIP == 0 or (frame_count - skipped_frames) % FRAME_SKIP == 0:
                     batch_tensors, batch_track_ids = [], []
                     for i, t_id in enumerate(ids):
@@ -174,12 +171,15 @@ def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
                                 track_identities[t_id] = winner
                                 active_track_memory[t_id]['buffer'] = []
 
-                # Compile Output Map
+                # Draw Visual Output Layers Directly Inside GPU Map Boundaries preventing deadlocks
                 for i in range(len(ids)):
                     t_id = ids[i]
-                    dict_names[t_id] = track_identities.get(t_id, "Analyzing...")
+                    box = boxes[i]
+                    name = track_identities.get(t_id, "Analyzing...")
+                    color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
+                    cv2.rectangle(display_frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                    cv2.putText(display_frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                # Clean Pruning Algorithms tracking accurate missing frame drops 
                 alive_ids = set(ids)
                 for t_id in list(active_track_memory.keys()):
                     if t_id not in alive_ids:
@@ -189,14 +189,14 @@ def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
                     else:
                         active_track_memory[t_id]['missing_frames'] = 0
 
-        # Dispatches minimal footprint Metadata block saving massive CPU Serialization bottlenecks 
-        if not res_queue.full():
-            res_queue.put_nowait((frame_id, boxes, ids, dict_names))
+        # Enforce highly reliable logic outputs directly to single bound queue strictly avoiding cross queue ID locks!
+        if not ann_queue.full():
+            ann_queue.put_nowait((display_frame, skipped_frames, current_active_faces, fps))
 
     # ==========================
-    # CLOSING SAVE 
+    # FINAL ATTENDANCE SECURE DUMP
     # ==========================
-    print(f"[ML PROCESS | {cam_name}] Shutting down. Generating Final Logs.")
+    print(f"[ML PROCESS | {cam_name}] Shutting down natively... Generating Log Checkboxes.")
     final_mem = {**archived_tracks, **active_track_memory}
     debug_data = []
     student_presence = {name: False for name in target_names}
@@ -237,17 +237,24 @@ def inference_worker(inf_queue, res_queue, cmd_queue, timestamp_str, cam_name):
 
 
 # ==========================================
-# BACKGROUND WORKER THREADS (MAIN PROCESS I/O ISOLATION)
+# BACKGROUND OUPUT AND INGESTION THREADS
 # ==========================================
-def rstp_reader(ip, running_event, raw_queue, inf_queue, draw_queue):
-    """ RTSP loop evaluating extreme skip conditions safely without blocking native bounds. """
+def rstp_reader(ip, running_event, raw_queue, inf_queue):
+    """ 
+    Absolute Watchdog. 
+    Implements CPU optimization via Input Throttling caching explicit dropped frames natively. 
+    """
     url = f"rtsp://{USERNAME}:{PASSWORD}@{ip}:554/stream1"
     cap = None
+    
     skipped_frames = 0
-    frame_id = 0
+    target_fps = 10.0
+    throttle_interval = 1.0 / target_fps
+    last_dispatch_time = 0
     
     while running_event.is_set():
         if cap is None or not cap.isOpened():
+            print(f"[*] Native Reader Booting IP {ip}...")
             cap = cv2.VideoCapture(url)
             if not cap.isOpened():
                 time.sleep(5)
@@ -260,27 +267,21 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue, draw_queue):
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         if fps <= 0: fps = 30
         
-        # Immediate RAW dispatch without bottlenecks. If backend disk stalls, throw immediately. 
+        # Raw Writer explicitly gets all original non-throttled data
         if not raw_queue.full():
             raw_queue.put_nowait((frame, fps, 1))
             
-        # CPU Safe ML Inference Control
-        # Bypasses frame logic safely holding counts mapping duplicates exact correctly toward padding 
-        if not inf_queue.full() and not draw_queue.full():
-            # Send cross-process 
-            inf_queue.put_nowait((frame_id, frame, skipped_frames))
-            
-            # Send locally strictly referencing memory pointers (Ultra low overhead)
-            draw_queue.put_nowait((frame_id, frame, skipped_frames, fps))
-            
+        # Throttled Dispatch evaluating constraints preventing CPU Serialization overload arrays entirely
+        now = time.perf_counter()
+        if (now - last_dispatch_time) >= throttle_interval and not inf_queue.full():
+            # Send cleanly directly towards processing layer explicitly counting dropped logic 
+            inf_queue.put_nowait((frame, fps, skipped_frames))
+            last_dispatch_time = now
             skipped_frames = 0
-            frame_id += 1
         else:
             skipped_frames += 1
                 
-    if cap:
-        cap.release()
-
+    if cap: cap.release()
 
 def raw_writer_worker(queue_obj, output_path, running_event):
     writer = None
@@ -301,61 +302,35 @@ def raw_writer_worker(queue_obj, output_path, running_event):
             if not running_event.is_set() and queue_obj.empty(): break
     if writer: writer.release()
 
-
-def ann_writer_worker(draw_queue, res_queue, ui_queue, output_path, running_event):
+def ann_writer_worker(ann_queue, ui_queue, output_path, running_event):
     """
-    Decoupled Drawing Writer Pipeline.
-    Merges local raw pointers combining safely extracted cross-process metadata independently resolving extreme CPU limits.
+    Highly robust generic bounds mapping directly towards duplicating skipped loops.
+    Strictly deadlock-free! 
     """
     writer = None
     while True:
         try:
-            item = draw_queue.get(timeout=0.2)
+            item = ann_queue.get(timeout=0.2)
             if item is None: break
-            frame_id, frame, skipped_frames, input_fps = item
-            
-            # Sync Wait isolating Metadata returned accurately mapped to Frame ID
-            meta = None
-            while running_event.is_set():
-                try:
-                    m = res_queue.get(timeout=0.1)
-                    if m[0] == frame_id:
-                        meta = m
-                        break
-                except queue.Empty:
-                    pass
-                    
-            if meta is None or not running_event.is_set(): break
-            
-            _, boxes, ids, dict_names = meta
-            active_faces = len(ids) if ids is not None else 0
-            
-            draw_frame = frame.copy()
-            for i in range(len(ids)):
-                t_id = ids[i]
-                box = boxes[i]
-                name = dict_names.get(t_id, "Analyzing...")
-                color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
-                cv2.rectangle(draw_frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-                cv2.putText(draw_frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            frame, skipped_frames, active_faces, input_fps = item
                 
             if writer is None:
-                h, w = draw_frame.shape[:2]
+                h, w = frame.shape[:2]
                 fps = input_fps if input_fps > 0 else 30
                 writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                 
-            # EXECUTE FRAME PADDING AVOIDING SPED UP PHENOMENON
+            # EXECUTE FRAME PADDING AVOIDING SPED UP PHENOMENON unconditionally avoiding dropped timing errors natively
             for _ in range(skipped_frames + 1):
-                writer.write(draw_frame)
+                writer.write(frame)
                 
             if not ui_queue.full():
-                ui_queue.put_nowait((draw_frame, active_faces))
+                ui_queue.put_nowait((frame, active_faces))
                 
         except queue.Empty:
-            if not running_event.is_set() and draw_queue.empty(): break
+            if not running_event.is_set() and ann_queue.empty(): break
             
     if writer: writer.release()
-    print(f"[*] Released Annotated Sequence: {output_path}")
+
 
 # ==========================================
 # MAIN DESKTOP GUI
@@ -435,39 +410,34 @@ class AttendanceApp(ctk.CTk):
 
         timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # === System Global Architecture ===
-        # CROSS PROCESS QUEUES
         self.cam1_inf_q = mp.Queue(maxsize=30)
-        self.cam1_res_q = mp.Queue(maxsize=30)
+        self.cam1_ann_q = mp.Queue(maxsize=150)
         self.cam1_cmd_q = mp.Queue()
         
         self.cam2_inf_q = mp.Queue(maxsize=30)
-        self.cam2_res_q = mp.Queue(maxsize=30)
+        self.cam2_ann_q = mp.Queue(maxsize=150)
         self.cam2_cmd_q = mp.Queue()
         
-        # INTERNAL THREAD QUEUES
-        self.cam1_draw_q = queue.Queue(maxsize=60)
         self.cam1_raw_q = queue.Queue(maxsize=60)
         self.cam1_ui_q = queue.Queue(maxsize=30)
         
-        self.cam2_draw_q = queue.Queue(maxsize=60)
         self.cam2_raw_q = queue.Queue(maxsize=60)
         self.cam2_ui_q = queue.Queue(maxsize=30)
 
-        # 1. Fire Multiprocessing Isolated CPU/GPU Enclaves
-        self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_res_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
-        self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_res_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
+        # 1. Fire Multiprocessing Dual Inference Core Threads safely bound
+        self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
+        self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
         self.ml_p1.daemon = True; self.ml_p1.start()
         self.ml_p2.daemon = True; self.ml_p2.start()
 
-        # 2. Fire Independent Light-Weight I/O Sinks
+        # 2. Fire Independent Sync Disconnected Writers 
         self.threads = [
             threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event)),
             threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event)),
-            threading.Thread(target=ann_writer_worker, args=(self.cam1_draw_q, self.cam1_res_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)),
-            threading.Thread(target=ann_writer_worker, args=(self.cam2_draw_q, self.cam2_res_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)),
-            threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.cam1_draw_q)),
-            threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.cam2_draw_q)),
+            threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)),
+            threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)),
+            threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q)),
+            threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q)),
             threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, CAM1_PRESETS, p_info['cam1'])),
             threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, CAM2_PRESETS, p_info['cam2']))
         ]
@@ -479,13 +449,12 @@ class AttendanceApp(ctk.CTk):
 
     def stop_tracking(self):
         if not self.running_event.is_set(): return
-        print("\n[*] Halting Sequences Natively... ")
         self.running_event.clear()
         
         self.cam1_cmd_q.put('STOP')
         self.cam2_cmd_q.put('STOP')
         
-        self.cam1_draw_q.put(None); self.cam2_draw_q.put(None)
+        self.cam1_ann_q.put(None); self.cam2_ann_q.put(None)
         self.cam1_raw_q.put(None); self.cam2_raw_q.put(None)
         
         self.start_btn.configure(state="normal")
@@ -523,7 +492,6 @@ class AttendanceApp(ctk.CTk):
             m, s = divmod(rem, 60)
             self.time_lbl.configure(text=f"Time Remaining: {h:02d}:{m:02d}:{s:02d}")
             
-            # Flush Internal UI queues natively mapped 
             frame1 = None
             while not self.cam1_ui_q.empty():
                 try: 
