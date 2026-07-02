@@ -2,3 +2,4 @@
 *.pt
 *.pkl
 *.bin
+__pycache__
