@@ -1,0 +1,11 @@
+opencv-python
+pandas
+customtkinter
+Pillow
+faiss-cpu
+torch
+torchvision
+numpy
+ultralytics
+facenet-pytorch
+requests
