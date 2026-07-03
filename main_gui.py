@@ -246,6 +246,7 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue):
     """
     url = f"rtsp://{USERNAME}:{PASSWORD}@{ip}:554/stream1"
     cap = None
+    last_frame_time = time.perf_counter()
     
     while running_event.is_set():
         if cap is None or not cap.isOpened():
@@ -254,21 +255,29 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue):
             if not cap.isOpened():
                 time.sleep(5)
                 continue
+            last_frame_time = time.perf_counter()
             
         ret, frame = cap.read()
+        now = time.perf_counter()
+        
         if not ret:
             cap.release(); cap = None; continue
             
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         if fps <= 0: fps = 30
         
+        target_interval = 1.0 / fps
+        delta = now - last_frame_time
+        skipped_frames = max(0, round(delta / target_interval) - 1)
+        last_frame_time = now
+        
         # Raw Writer explicitly gets all original non-throttled data
         if not raw_queue.full():
-            raw_queue.put_nowait((frame, fps, 1))
+            raw_queue.put_nowait((frame, fps, skipped_frames + 1))
             
         # Throttled Dispatch evaluating constraints preventing CPU Serialization overload arrays entirely
         if not inf_queue.full():
-            inf_queue.put_nowait((frame, fps, 0))
+            inf_queue.put_nowait((frame, fps, skipped_frames))
                 
     if cap: cap.release()
 
