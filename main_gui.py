@@ -247,11 +247,6 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue):
     url = f"rtsp://{USERNAME}:{PASSWORD}@{ip}:554/stream1"
     cap = None
     
-    skipped_frames = 0
-    target_fps = 30.0
-    throttle_interval = 1.0 / target_fps
-    last_dispatch_time = 0
-    
     while running_event.is_set():
         if cap is None or not cap.isOpened():
             print(f"[*] Native Reader Booting IP {ip}...")
@@ -272,14 +267,8 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue):
             raw_queue.put_nowait((frame, fps, 1))
             
         # Throttled Dispatch evaluating constraints preventing CPU Serialization overload arrays entirely
-        now = time.perf_counter()
-        if (now - last_dispatch_time) >= throttle_interval and not inf_queue.full():
-            # Send cleanly directly towards processing layer explicitly counting dropped logic 
-            inf_queue.put_nowait((frame, fps, skipped_frames))
-            last_dispatch_time = now
-            skipped_frames = 0
-        else:
-            skipped_frames += 1
+        if not inf_queue.full():
+            inf_queue.put_nowait((frame, fps, 0))
                 
     if cap: cap.release()
 
@@ -494,18 +483,18 @@ class AttendanceApp(ctk.CTk):
             self.time_lbl.configure(text=f"Time Remaining: {h:02d}:{m:02d}:{s:02d}")
             
             frame1 = None
-            while not self.cam1_ui_q.empty():
+            if not self.cam1_ui_q.empty():
                 try: 
                     res1 = self.cam1_ui_q.get_nowait()
                     frame1, self.cam1_active_faces = res1
-                except queue.Empty: break
+                except queue.Empty: pass
                     
             frame2 = None
-            while not self.cam2_ui_q.empty():
+            if not self.cam2_ui_q.empty():
                 try: 
                     res2 = self.cam2_ui_q.get_nowait()
                     frame2, self.cam2_active_faces = res2
-                except queue.Empty: break
+                except queue.Empty: pass
             
             if (now - self.last_fps_time) >= 1.0:
                 self.sys_fps = self.frames_rendered / (now - self.last_fps_time)
