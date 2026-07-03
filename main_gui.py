@@ -520,12 +520,12 @@ class AttendanceApp(ctk.CTk):
                 self.frames_rendered += 1
                 frame_rgb = cv2.cvtColor(target_frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(frame_rgb)
-                imgtk = ctk.CTkImage(light_image=img, size=(1000, 780))
+                imgtk = ImageTk.PhotoImage(image=img)
                 self.video_frame.configure(image=imgtk, text="")
                 self.video_frame.image = imgtk
                 
         except Exception as e: pass
-        finally: self.after(33, self.update_gui_frame)
+        finally: self.after(10, self.update_gui_frame)
 
 if __name__ == "__main__":
     mp.freeze_support()
