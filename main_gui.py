@@ -248,7 +248,7 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue):
     cap = None
     
     skipped_frames = 0
-    target_fps = 10.0
+    target_fps = 30.0
     throttle_interval = 1.0 / target_fps
     last_dispatch_time = 0
     
@@ -324,7 +324,8 @@ def ann_writer_worker(ann_queue, ui_queue, output_path, running_event):
                 writer.write(frame)
                 
             if not ui_queue.full():
-                ui_queue.put_nowait((frame, active_faces))
+                ui_frame = cv2.resize(frame, (1000, 780))
+                ui_queue.put_nowait((ui_frame, active_faces))
                 
         except queue.Empty:
             if not running_event.is_set() and ann_queue.empty(): break
@@ -519,7 +520,7 @@ class AttendanceApp(ctk.CTk):
                 self.frames_rendered += 1
                 frame_rgb = cv2.cvtColor(target_frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(frame_rgb)
-                imgtk = ctk.CTkImage(light_image=img, dark_image=img, size=(1000, 780))
+                imgtk = ctk.CTkImage(light_image=img, size=(1000, 780))
                 self.video_frame.configure(image=imgtk, text="")
                 self.video_frame.image = imgtk
                 
