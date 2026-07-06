@@ -36,8 +36,8 @@ PROTOCOLS = {
     3: {"name": "45-Minute", "cam1": 332, "cam2": 445}
 }
 
-CONFIDENCE_THRESHOLD = 0.78
-FRAME_SKIP = 2
+CONFIDENCE_THRESHOLD = 0.79
+FRAME_SKIP = 1
 FRAMES_PER_VOTE = 5
 
 BASE_OUTPUT_DIR = "VIDEOS"
@@ -72,12 +72,15 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
     Writes native annotations directly against duplicate outputs maintaining 1-1 strict bounds flawlessly.
     """
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    use_half = torch.cuda.is_available()
     print(f"[ML PROCESS | {cam_name}] Initializing strictly on {device}...")
     
     try:
         yolo_model = YOLO('yolov8n-face.pt', task='detect')
         yolo_model.to(device)
         resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+        if use_half:
+            resnet = resnet.half()
         
         faiss_index_path = './face_attendance_faiss.bin'
         if os.path.exists(faiss_index_path):
@@ -129,7 +132,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         current_active_faces = 0
 
         if index is not None and len(target_names) > 0:
-            results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
+            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False)
             has_detections = results[0].boxes.id is not None
             
             if has_detections:
@@ -148,8 +151,16 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                 if frame_count % FRAME_SKIP == 0 or (frame_count - skipped_frames) % FRAME_SKIP == 0:
                     batch_tensors, batch_track_ids = [], []
                     for i, t_id in enumerate(ids):
+                        x1, y1, x2, y2 = boxes[i]
+                        box_w, box_h = x2 - x1, y2 - y1
+                        if box_w < 65 or box_h < 65:
+                            continue
+                        aspect_ratio = box_w / box_h if box_h != 0 else 0
+                        if aspect_ratio < 0.55 or aspect_ratio > 1.55:
+                            continue
+
                         crop = crop_standard(frame, boxes[i])
-                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 4.0:
+                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 5.0:
                             pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
                             t = (to_tensor(pil_img).unsqueeze(0).to(device) - 0.5) * 2
                             batch_tensors.append(t)
@@ -157,7 +168,12 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                     
                     if batch_tensors:
                         with torch.no_grad():
-                            embeddings = resnet(torch.cat(batch_tensors, dim=0)).cpu().numpy().astype('float32')
+                            batch_tensor_cat = torch.cat(batch_tensors, dim=0)
+                            if use_half:
+                                batch_tensor_cat = batch_tensor_cat.half()
+                            else:
+                                batch_tensor_cat = batch_tensor_cat.float()
+                            embeddings = resnet(batch_tensor_cat).cpu().numpy().astype('float32')
                         faiss.normalize_L2(embeddings)
                         sims, indices = index.search(embeddings, k=1)
                         for i, t_id in enumerate(batch_track_ids):
@@ -184,7 +200,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                 for t_id in list(active_track_memory.keys()):
                     if t_id not in alive_ids:
                         active_track_memory[t_id]['missing_frames'] += (skipped_frames + 1)
-                        if active_track_memory[t_id]['missing_frames'] > 15:
+                        if active_track_memory[t_id]['missing_frames'] > 50:
                             archived_tracks[t_id] = active_track_memory.pop(t_id)
                     else:
                         active_track_memory[t_id]['missing_frames'] = 0
@@ -214,7 +230,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
             win_ratio = counts.get(winner, 0) / valid_votes_count
             total_samples = len(all_preds)
             sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0
-            status = "Passed" if (total_frames >= 45 and total_samples >= 15 and sample_ratio >= 0.25 and win_ratio >= 0.60) else "Failed"
+            status = "Passed" if (total_frames >= 45 and total_samples >= 15 and sample_ratio >= 0.33 and win_ratio >= 0.52) else "Failed"
         else:
             winner = "Unknown"
             status = "Failed"
