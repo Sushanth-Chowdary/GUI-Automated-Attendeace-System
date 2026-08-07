@@ -33,7 +33,7 @@ CAM2_PRESETS = [1, 2, 3, 4, 5, 6]
 PROTOCOLS = {
     1: {"name": "5-Minute", "cam1": 32, "cam2": 45},
     2: {"name": "15-Minute", "cam1": 107, "cam2": 145},
-    3: {"name": "45-Minute", "cam1": 332, "cam2": 445}
+    3: {"name": "20-Minute", "cam1": 145, "cam2": 195}
 }
 
 CONFIDENCE_THRESHOLD = 0.79
@@ -255,7 +255,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
 # ==========================================
 # BACKGROUND OUPUT AND INGESTION THREADS
 # ==========================================
-def rstp_reader(ip, running_event, raw_queue, inf_queue):
+def rstp_reader(ip, running_event, raw_queue, inf_queue, enable_inference=True):
     """ 
     Absolute Watchdog. 
     Implements CPU optimization via Input Throttling caching explicit dropped frames natively. 
@@ -292,12 +292,12 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue):
             raw_queue.put_nowait((frame, fps, skipped_frames + 1))
             
         # Throttled Dispatch evaluating constraints preventing CPU Serialization overload arrays entirely
-        if not inf_queue.full():
+        if enable_inference and not inf_queue.full():
             inf_queue.put_nowait((frame, fps, skipped_frames))
                 
     if cap: cap.release()
 
-def raw_writer_worker(queue_obj, output_path, running_event):
+def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_ui=False):
     writer = None
     while True:
         try:
@@ -312,6 +312,11 @@ def raw_writer_worker(queue_obj, output_path, running_event):
                 
             for _ in range(duplicates):
                 writer.write(frame)
+                
+            if populate_ui and ui_queue is not None:
+                if not ui_queue.full():
+                    ui_frame = cv2.resize(frame, (1000, 780))
+                    ui_queue.put_nowait((ui_frame, 0))
         except queue.Empty:
             if not running_event.is_set() and queue_obj.empty(): break
     if writer: writer.release()
@@ -389,6 +394,10 @@ class AttendanceApp(ctk.CTk):
             rb = ctk.CTkRadioButton(self.sidebar_frame, text=f"{info['name']} Protocol", variable=self.selected_protocol, value=p)
             rb.pack(pady=5, padx=20, anchor="w")
             
+        self.live_tracking_var = ctk.BooleanVar(value=True)
+        self.live_tracking_switch = ctk.CTkSwitch(self.sidebar_frame, text="Live Tracking", variable=self.live_tracking_var)
+        self.live_tracking_switch.pack(pady=(15,0), padx=20, anchor="w")
+            
         self.start_btn = ctk.CTkButton(self.sidebar_frame, text="Execute Bound Loop", command=self.start_tracking)
         self.start_btn.pack(pady=20, padx=20)
         
@@ -439,23 +448,36 @@ class AttendanceApp(ctk.CTk):
         self.cam2_raw_q = queue.Queue(maxsize=60)
         self.cam2_ui_q = queue.Queue(maxsize=30)
 
+        self.live_tracking_active = self.live_tracking_var.get()
+
         # 1. Fire Multiprocessing Dual Inference Core Threads safely bound
-        self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
-        self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
-        self.ml_p1.daemon = True; self.ml_p1.start()
-        self.ml_p2.daemon = True; self.ml_p2.start()
+        if self.live_tracking_active:
+            self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
+            self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
+            self.ml_p1.daemon = True; self.ml_p1.start()
+            self.ml_p2.daemon = True; self.ml_p2.start()
 
         # 2. Fire Independent Sync Disconnected Writers 
         self.threads = [
-            threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event)),
-            threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event)),
-            threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)),
-            threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)),
-            threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q)),
-            threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q)),
+            threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.live_tracking_active)),
+            threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.live_tracking_active)),
             threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, CAM1_PRESETS, p_info['cam1'])),
             threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, CAM2_PRESETS, p_info['cam2']))
         ]
+        
+        if self.live_tracking_active:
+            self.threads.extend([
+                threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, False)),
+                threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, False)),
+                threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)),
+                threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event))
+            ])
+        else:
+            self.threads.extend([
+                threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, True)),
+                threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, True)),
+            ])
+            
         for t in self.threads: t.start()
 
         self.last_fps_time = time.perf_counter()
@@ -466,10 +488,11 @@ class AttendanceApp(ctk.CTk):
         if not self.running_event.is_set(): return
         self.running_event.clear()
         
-        self.cam1_cmd_q.put('STOP')
-        self.cam2_cmd_q.put('STOP')
-        
-        self.cam1_ann_q.put(None); self.cam2_ann_q.put(None)
+        if getattr(self, 'live_tracking_active', True):
+            self.cam1_cmd_q.put('STOP')
+            self.cam2_cmd_q.put('STOP')
+            self.cam1_ann_q.put(None); self.cam2_ann_q.put(None)
+            
         self.cam1_raw_q.put(None); self.cam2_raw_q.put(None)
         
         self.start_btn.configure(state="normal")
