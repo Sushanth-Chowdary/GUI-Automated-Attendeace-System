@@ -32,8 +32,10 @@ CAM2_PRESETS = [1, 2, 3, 4, 5, 6]
 
 PROTOCOLS = {
     1: {"name": "5-Minute", "cam1": 32, "cam2": 45},
-    2: {"name": "15-Minute", "cam1": 107, "cam2": 145},
-    3: {"name": "20-Minute", "cam1": 145, "cam2": 195}
+    2: {"name": "10-Minute", "cam1": 70, "cam2": 95},
+    3: {"name": "15-Minute", "cam1": 107, "cam2": 145},
+    4: {"name": "20-Minute", "cam1": 145, "cam2": 195},
+    5: {"name": "25-Minute", "cam1": 182, "cam2": 245}
 }
 
 CONFIDENCE_THRESHOLD = 0.79
@@ -377,7 +379,7 @@ class AttendanceApp(ctk.CTk):
         self.setup_ui()
 
     def setup_ui(self):
-        self.sidebar_frame = ctk.CTkFrame(self, width=320, corner_radius=0)
+        self.sidebar_frame = ctk.CTkScrollableFrame(self, width=350, corner_radius=0)
         self.sidebar_frame.pack(side="left", fill="y", padx=0, pady=0)
         
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Attendance Core ML", font=ctk.CTkFont(size=22, weight="bold"))
@@ -387,6 +389,18 @@ class AttendanceApp(ctk.CTk):
         self.view_label.pack(pady=(10,0), padx=20, anchor="w")
         self.view_toggle = ctk.CTkSegmentedButton(self.sidebar_frame, values=["Camera 1", "Camera 2"], variable=self.view_target)
         self.view_toggle.pack(pady=10, padx=20, fill="x")
+
+        self.camera_selection_var = ctk.StringVar(value="Both Cameras")
+        self.camera_selection_toggle = ctk.CTkSegmentedButton(self.sidebar_frame, values=["Camera 1 Only", "Camera 2 Only", "Both Cameras"], variable=self.camera_selection_var)
+        self.camera_selection_toggle.pack(pady=10, padx=20, fill="x")
+
+        self.cam1_mode_var = ctk.StringVar(value="Record and Live Track")
+        self.cam1_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame, values=["Just Record", "Record and Live Track"], variable=self.cam1_mode_var)
+        self.cam1_mode_menu.pack(pady=5, padx=20, fill="x")
+
+        self.cam2_mode_var = ctk.StringVar(value="Record and Live Track")
+        self.cam2_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame, values=["Just Record", "Record and Live Track"], variable=self.cam2_mode_var)
+        self.cam2_mode_menu.pack(pady=5, padx=20, fill="x")
         
         self.protocol_label = ctk.CTkLabel(self.sidebar_frame, text="Execution Iteration:")
         self.protocol_label.pack(pady=(15,0), padx=20, anchor="w")
@@ -394,9 +408,46 @@ class AttendanceApp(ctk.CTk):
             rb = ctk.CTkRadioButton(self.sidebar_frame, text=f"{info['name']} Protocol", variable=self.selected_protocol, value=p)
             rb.pack(pady=5, padx=20, anchor="w")
             
-        self.live_tracking_var = ctk.BooleanVar(value=True)
-        self.live_tracking_switch = ctk.CTkSwitch(self.sidebar_frame, text="Live Tracking", variable=self.live_tracking_var)
-        self.live_tracking_switch.pack(pady=(15,0), padx=20, anchor="w")
+        self.ptz_label1 = ctk.CTkLabel(self.sidebar_frame, text="Cam1 Presets:")
+        self.ptz_label1.pack(pady=(10,0), padx=20, anchor="w")
+        self.preset_frame1 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.preset_frame1.pack(pady=5, padx=20, fill="x")
+        self.cam1_preset_vars = {}
+        for p in CAM1_PRESETS:
+            var = ctk.BooleanVar(value=True)
+            self.cam1_preset_vars[p] = var
+            cb = ctk.CTkCheckBox(self.preset_frame1, text=str(p), variable=var, width=40)
+            cb.grid(row=(p-1)//4, column=(p-1)%4, padx=5, pady=5)
+
+        self.ptz_label2 = ctk.CTkLabel(self.sidebar_frame, text="Cam2 Presets:")
+        self.ptz_label2.pack(pady=(10,0), padx=20, anchor="w")
+        self.preset_frame2 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.preset_frame2.pack(pady=5, padx=20, fill="x")
+        self.cam2_preset_vars = {}
+        for p in CAM2_PRESETS:
+            var = ctk.BooleanVar(value=True)
+            self.cam2_preset_vars[p] = var
+            cb = ctk.CTkCheckBox(self.preset_frame2, text=str(p), variable=var, width=40)
+            cb.grid(row=(p-1)//4, column=(p-1)%4, padx=5, pady=5)
+
+        self.ptz_manual_label = ctk.CTkLabel(self.sidebar_frame, text="Manual PTZ Controls:")
+        self.ptz_manual_label.pack(pady=(10,0), padx=20, anchor="w")
+        self.manual_ptz_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.manual_ptz_frame.pack(pady=5, padx=20, fill="x")
+        
+        btn_up = ctk.CTkButton(self.manual_ptz_frame, text="Up", width=50, command=lambda: self.manual_ptz("up"))
+        btn_down = ctk.CTkButton(self.manual_ptz_frame, text="Down", width=50, command=lambda: self.manual_ptz("down"))
+        btn_left = ctk.CTkButton(self.manual_ptz_frame, text="Left", width=50, command=lambda: self.manual_ptz("left"))
+        btn_right = ctk.CTkButton(self.manual_ptz_frame, text="Right", width=50, command=lambda: self.manual_ptz("right"))
+        btn_zi = ctk.CTkButton(self.manual_ptz_frame, text="Zoom In", width=50, command=lambda: self.manual_ptz("zoomin"))
+        btn_zo = ctk.CTkButton(self.manual_ptz_frame, text="Zoom Out", width=50, command=lambda: self.manual_ptz("zoomout"))
+
+        btn_up.grid(row=0, column=1, padx=2, pady=2)
+        btn_down.grid(row=2, column=1, padx=2, pady=2)
+        btn_left.grid(row=1, column=0, padx=2, pady=2)
+        btn_right.grid(row=1, column=2, padx=2, pady=2)
+        btn_zi.grid(row=0, column=3, padx=2, pady=2)
+        btn_zo.grid(row=2, column=3, padx=2, pady=2)
             
         self.start_btn = ctk.CTkButton(self.sidebar_frame, text="Execute Bound Loop", command=self.start_tracking)
         self.start_btn.pack(pady=20, padx=20)
@@ -427,57 +478,72 @@ class AttendanceApp(ctk.CTk):
         
         sel = self.selected_protocol.get()
         p_info = PROTOCOLS[sel]
+
+        selected_cam1_presets = [p for p, var in self.cam1_preset_vars.items() if var.get()]
+        selected_cam2_presets = [p for p, var in self.cam2_preset_vars.items() if var.get()]
         
-        total_time_cam1 = len(CAM1_PRESETS) * (p_info['cam1'] + 5)
-        total_time_cam2 = len(CAM2_PRESETS) * (p_info['cam2'] + 5)
+        cam_selection = self.camera_selection_var.get()
+        use_cam1 = cam_selection in ["Camera 1 Only", "Both Cameras"]
+        use_cam2 = cam_selection in ["Camera 2 Only", "Both Cameras"]
+        
+        mode1 = self.cam1_mode_var.get() == "Record and Live Track"
+        mode2 = self.cam2_mode_var.get() == "Record and Live Track"
+        
+        total_time_cam1 = len(selected_cam1_presets) * (p_info['cam1'] + 5) if use_cam1 else 0
+        total_time_cam2 = len(selected_cam2_presets) * (p_info['cam2'] + 5) if use_cam2 else 0
         self.t_end = time.perf_counter() + max(total_time_cam1, total_time_cam2)
 
         timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.threads = []
         
-        self.cam1_inf_q = mp.Queue(maxsize=30)
-        self.cam1_ann_q = mp.Queue(maxsize=150)
-        self.cam1_cmd_q = mp.Queue()
-        
-        self.cam2_inf_q = mp.Queue(maxsize=30)
-        self.cam2_ann_q = mp.Queue(maxsize=150)
-        self.cam2_cmd_q = mp.Queue()
-        
-        self.cam1_raw_q = queue.Queue(maxsize=60)
-        self.cam1_ui_q = queue.Queue(maxsize=30)
-        
-        self.cam2_raw_q = queue.Queue(maxsize=60)
-        self.cam2_ui_q = queue.Queue(maxsize=30)
-
-        self.live_tracking_active = self.live_tracking_var.get()
-
-        # 1. Fire Multiprocessing Dual Inference Core Threads safely bound
-        if self.live_tracking_active:
-            self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
-            self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
-            self.ml_p1.daemon = True; self.ml_p1.start()
-            self.ml_p2.daemon = True; self.ml_p2.start()
-
-        # 2. Fire Independent Sync Disconnected Writers 
-        self.threads = [
-            threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.live_tracking_active)),
-            threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.live_tracking_active)),
-            threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, CAM1_PRESETS, p_info['cam1'])),
-            threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, CAM2_PRESETS, p_info['cam2']))
-        ]
-        
-        if self.live_tracking_active:
-            self.threads.extend([
-                threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, False)),
-                threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, False)),
-                threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)),
-                threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event))
-            ])
-        else:
-            self.threads.extend([
-                threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, True)),
-                threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, True)),
-            ])
+        if use_cam1:
+            self.cam1_raw_q = queue.Queue(maxsize=60)
+            self.cam1_ui_q = queue.Queue(maxsize=30)
             
+            if mode1:
+                self.cam1_inf_q = mp.Queue(maxsize=30)
+                self.cam1_ann_q = mp.Queue(maxsize=150)
+                self.cam1_cmd_q = mp.Queue()
+            else:
+                self.cam1_inf_q = None
+                self.cam1_ann_q = None
+                self.cam1_cmd_q = None
+                
+            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, mode1)))
+            self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, selected_cam1_presets, p_info['cam1'])))
+            
+            if mode1:
+                self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
+                self.ml_p1.daemon = True; self.ml_p1.start()
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, False)))
+                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)))
+            else:
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, True)))
+
+        if use_cam2:
+            self.cam2_raw_q = queue.Queue(maxsize=60)
+            self.cam2_ui_q = queue.Queue(maxsize=30)
+            
+            if mode2:
+                self.cam2_inf_q = mp.Queue(maxsize=30)
+                self.cam2_ann_q = mp.Queue(maxsize=150)
+                self.cam2_cmd_q = mp.Queue()
+            else:
+                self.cam2_inf_q = None
+                self.cam2_ann_q = None
+                self.cam2_cmd_q = None
+                
+            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, mode2)))
+            self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, selected_cam2_presets, p_info['cam2'])))
+            
+            if mode2:
+                self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
+                self.ml_p2.daemon = True; self.ml_p2.start()
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, False)))
+                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)))
+            else:
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, True)))
+
         for t in self.threads: t.start()
 
         self.last_fps_time = time.perf_counter()
@@ -488,12 +554,19 @@ class AttendanceApp(ctk.CTk):
         if not self.running_event.is_set(): return
         self.running_event.clear()
         
-        if getattr(self, 'live_tracking_active', True):
+        if hasattr(self, 'cam1_cmd_q') and self.cam1_cmd_q:
             self.cam1_cmd_q.put('STOP')
+        if hasattr(self, 'cam2_cmd_q') and self.cam2_cmd_q:
             self.cam2_cmd_q.put('STOP')
-            self.cam1_ann_q.put(None); self.cam2_ann_q.put(None)
+        if hasattr(self, 'cam1_ann_q') and self.cam1_ann_q:
+            self.cam1_ann_q.put(None)
+        if hasattr(self, 'cam2_ann_q') and self.cam2_ann_q:
+            self.cam2_ann_q.put(None)
             
-        self.cam1_raw_q.put(None); self.cam2_raw_q.put(None)
+        if hasattr(self, 'cam1_raw_q') and self.cam1_raw_q:
+            self.cam1_raw_q.put(None)
+        if hasattr(self, 'cam2_raw_q') and self.cam2_raw_q:
+            self.cam2_raw_q.put(None)
         
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
@@ -513,6 +586,15 @@ class AttendanceApp(ctk.CTk):
             while self.running_event.is_set() and (time.perf_counter() - t_start) < duration:
                 time.sleep(0.1)
 
+    def manual_ptz(self, command):
+        target = self.view_target.get()
+        ip = CAMERA_IP_1 if target == "Camera 1" else CAMERA_IP_2
+        url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&{command}"
+        def send_cmd():
+            try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
+            except: pass
+        threading.Thread(target=send_cmd).start()
+
     def update_gui_frame(self):
         if not self.running_event.is_set():
             self.video_frame.configure(image=None, text="Camera ML Feed Offline")
@@ -531,14 +613,14 @@ class AttendanceApp(ctk.CTk):
             self.time_lbl.configure(text=f"Time Remaining: {h:02d}:{m:02d}:{s:02d}")
             
             frame1 = None
-            if not self.cam1_ui_q.empty():
+            if hasattr(self, 'cam1_ui_q') and self.cam1_ui_q and not self.cam1_ui_q.empty():
                 try: 
                     res1 = self.cam1_ui_q.get_nowait()
                     frame1, self.cam1_active_faces = res1
                 except queue.Empty: pass
                     
             frame2 = None
-            if not self.cam2_ui_q.empty():
+            if hasattr(self, 'cam2_ui_q') and self.cam2_ui_q and not self.cam2_ui_q.empty():
                 try: 
                     res2 = self.cam2_ui_q.get_nowait()
                     frame2, self.cam2_active_faces = res2
