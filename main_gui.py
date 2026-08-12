@@ -394,13 +394,9 @@ class AttendanceApp(ctk.CTk):
         self.camera_selection_toggle = ctk.CTkSegmentedButton(self.sidebar_frame, values=["Camera 1 Only", "Camera 2 Only", "Both Cameras"], variable=self.camera_selection_var)
         self.camera_selection_toggle.pack(pady=10, padx=20, fill="x")
 
-        self.cam1_mode_var = ctk.StringVar(value="Record and Live Track")
-        self.cam1_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame, values=["Just Record", "Record and Live Track"], variable=self.cam1_mode_var)
-        self.cam1_mode_menu.pack(pady=5, padx=20, fill="x")
-
-        self.cam2_mode_var = ctk.StringVar(value="Record and Live Track")
-        self.cam2_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame, values=["Just Record", "Record and Live Track"], variable=self.cam2_mode_var)
-        self.cam2_mode_menu.pack(pady=5, padx=20, fill="x")
+        self.global_live_tracking_var = ctk.BooleanVar(value=True)
+        self.global_live_tracking_switch = ctk.CTkSwitch(self.sidebar_frame, text="Live Tracking", variable=self.global_live_tracking_var)
+        self.global_live_tracking_switch.pack(pady=(15,0), padx=20, anchor="w")
         
         self.protocol_label = ctk.CTkLabel(self.sidebar_frame, text="Execution Iteration:")
         self.protocol_label.pack(pady=(15,0), padx=20, anchor="w")
@@ -486,8 +482,9 @@ class AttendanceApp(ctk.CTk):
         use_cam1 = cam_selection in ["Camera 1 Only", "Both Cameras"]
         use_cam2 = cam_selection in ["Camera 2 Only", "Both Cameras"]
         
-        mode1 = self.cam1_mode_var.get() == "Record and Live Track"
-        mode2 = self.cam2_mode_var.get() == "Record and Live Track"
+        global_track = self.global_live_tracking_var.get()
+        mode1 = global_track
+        mode2 = global_track
         
         total_time_cam1 = len(selected_cam1_presets) * (p_info['cam1'] + 5) if use_cam1 else 0
         total_time_cam2 = len(selected_cam2_presets) * (p_info['cam2'] + 5) if use_cam2 else 0
