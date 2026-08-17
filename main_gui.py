@@ -143,7 +143,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         current_active_faces = 0
 
         if index is not None and len(target_names) > 0:
-            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False)
+            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, half=use_half, imgsz=640)
             has_detections = results[0].boxes.id is not None
             
             if has_detections:
@@ -177,7 +177,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                             batch_track_ids.append(t_id)
                     
                     if batch_tensors:
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             batch_tensor_cat = torch.cat(batch_tensors, dim=0)
                             if use_half:
                                 batch_tensor_cat = batch_tensor_cat.half()
