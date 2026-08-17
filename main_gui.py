@@ -65,6 +65,15 @@ def crop_standard(img, box):
     y2 = min(img.shape[0], y2 + margin_y)
     return img[y1:y2, x1:x2]
 
+def preprocess_crop(crop, device, use_half=True):
+    # Resize to 160x160 directly with OpenCV (fast C++ backend)
+    resized = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
+    # BGR to RGB, normalize [0, 255] -> [-1, 1]
+    tensor = torch.from_numpy(resized[:, :, ::-1].copy()).permute(2, 0, 1).float()
+    tensor = (tensor / 127.5) - 1.0
+    tensor = tensor.unsqueeze(0).to(device)
+    return tensor.half() if use_half else tensor
+
 # ==========================================
 # MULTIPROCESSING INFERENCE PROCESS (THROTTLED CPU)
 # ==========================================
@@ -163,8 +172,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
 
                         crop = crop_standard(frame, boxes[i])
                         if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 5.0:
-                            pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                            t = (to_tensor(pil_img).unsqueeze(0).to(device) - 0.5) * 2
+                            t = preprocess_crop(crop, device, use_half)
                             batch_tensors.append(t)
                             batch_track_ids.append(t_id)
                     
@@ -317,7 +325,7 @@ def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_
                 
             if populate_ui and ui_queue is not None:
                 if not ui_queue.full():
-                    ui_frame = cv2.resize(frame, (1000, 780))
+                    ui_frame = cv2.resize(frame, (1024, 576))
                     ui_queue.put_nowait((ui_frame, 0))
         except queue.Empty:
             if not running_event.is_set() and queue_obj.empty(): break
@@ -345,7 +353,7 @@ def ann_writer_worker(ann_queue, ui_queue, output_path, running_event):
                 writer.write(frame)
                 
             if not ui_queue.full():
-                ui_frame = cv2.resize(frame, (1000, 780))
+                ui_frame = cv2.resize(frame, (1024, 576))
                 ui_queue.put_nowait((ui_frame, active_faces))
                 
         except queue.Empty:
@@ -462,7 +470,7 @@ class AttendanceApp(ctk.CTk):
         self.faces_lbl = ctk.CTkLabel(self.sidebar_frame, text="Target Faces Detected: 0", font=ctk.CTkFont(size=14))
         self.faces_lbl.pack(pady=5, padx=20, anchor="w")
 
-        self.video_frame = ctk.CTkLabel(self, text="Camera ML Feed Offline", bg_color="gray", width=950, height=750)
+        self.video_frame = ctk.CTkLabel(self, text="Camera ML Feed Offline", bg_color="gray", width=1024, height=576)
         self.video_frame.pack(side="right", fill="both", expand=True, padx=20, pady=20)
 
     def start_tracking(self):
