@@ -65,14 +65,7 @@ def crop_standard(img, box):
     y2 = min(img.shape[0], y2 + margin_y)
     return img[y1:y2, x1:x2]
 
-def preprocess_crop(crop, device, use_half=True):
-    # Resize to 160x160 directly with OpenCV (fast C++ backend)
-    resized = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
-    # BGR to RGB, normalize [0, 255] -> [-1, 1]
-    tensor = torch.from_numpy(resized[:, :, ::-1].copy()).permute(2, 0, 1).float()
-    tensor = (tensor / 127.5) - 1.0
-    tensor = tensor.unsqueeze(0).to(device)
-    return tensor.half() if use_half else tensor
+
 
 # ==========================================
 # MULTIPROCESSING INFERENCE PROCESS (THROTTLED CPU)
@@ -138,8 +131,8 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         frame_count += (skipped_frames + 1)
         fps = input_fps if input_fps > 0 else 30
         
-        # Deadlock Elimination: Frame is drawn explicitly without sync-queue loops globally limiting logic
-        display_frame = frame.copy()
+        # Deadlock Elimination: Collect tracking metadata strictly decoupled from UI loop drawing frames globally
+        metadata = {'boxes': [], 'ids': [], 'names': []}
         current_active_faces = 0
 
         if index is not None and len(target_names) > 0:
@@ -171,19 +164,20 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                             continue
 
                         crop = crop_standard(frame, boxes[i])
-                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 5.0:
-                            t = preprocess_crop(crop, device, use_half)
-                            batch_tensors.append(t)
+                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_16S).var() > 5.0:
+                            resized = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
+                            batch_tensors.append(resized)
                             batch_track_ids.append(t_id)
                     
                     if batch_tensors:
                         with torch.inference_mode():
-                            batch_tensor_cat = torch.cat(batch_tensors, dim=0)
+                            batch_array = np.stack(batch_tensors, axis=0)
+                            batch_tensor = torch.from_numpy(batch_array).to(device, non_blocking=True).float()
+                            batch_tensor = batch_tensor.permute(0, 3, 1, 2)[:, [2, 1, 0], :, :]
+                            batch_tensor = (batch_tensor / 127.5) - 1.0
                             if use_half:
-                                batch_tensor_cat = batch_tensor_cat.half()
-                            else:
-                                batch_tensor_cat = batch_tensor_cat.float()
-                            embeddings = resnet(batch_tensor_cat).cpu().numpy().astype('float32')
+                                batch_tensor = batch_tensor.half()
+                            embeddings = resnet(batch_tensor).cpu().numpy().astype('float32')
                         faiss.normalize_L2(embeddings)
                         sims, indices = index.search(embeddings, k=1)
                         for i, t_id in enumerate(batch_track_ids):
@@ -197,14 +191,14 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                                 track_identities[t_id] = winner
                                 active_track_memory[t_id]['buffer'] = []
 
-                # Draw Visual Output Layers Directly Inside GPU Map Boundaries preventing deadlocks
+                # Collect tracking metadata instead of drawing on frames directly
                 for i in range(len(ids)):
                     t_id = ids[i]
                     box = boxes[i]
                     name = track_identities.get(t_id, "Analyzing...")
-                    color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
-                    cv2.rectangle(display_frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-                    cv2.putText(display_frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    metadata['boxes'].append(box)
+                    metadata['ids'].append(t_id)
+                    metadata['names'].append(name)
 
                 alive_ids = set(ids)
                 for t_id in list(active_track_memory.keys()):
@@ -216,8 +210,10 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                         active_track_memory[t_id]['missing_frames'] = 0
 
         # Enforce highly reliable logic outputs directly to single bound queue strictly avoiding cross queue ID locks!
-        if not ann_queue.full():
-            ann_queue.put_nowait((display_frame, skipped_frames, current_active_faces, fps))
+        try:
+            ann_queue.put((metadata['boxes'], metadata['ids'], metadata['names'], skipped_frames, current_active_faces, fps), timeout=0.2)
+        except queue.Full:
+            pass
 
     # ==========================
     # FINAL ATTENDANCE SECURE DUMP
@@ -265,7 +261,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
 # ==========================================
 # BACKGROUND OUPUT AND INGESTION THREADS
 # ==========================================
-def rstp_reader(ip, running_event, raw_queue, inf_queue, enable_inference=True):
+def rstp_reader(ip, running_event, raw_queue, inf_queue, ann_frame_queue=None, enable_inference=True):
     """ 
     Absolute Watchdog. 
     Implements CPU optimization via Input Throttling caching explicit dropped frames natively. 
@@ -302,8 +298,11 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue, enable_inference=True):
             raw_queue.put_nowait((frame, fps, skipped_frames + 1))
             
         # Throttled Dispatch evaluating constraints preventing CPU Serialization overload arrays entirely
-        if enable_inference and not inf_queue.full():
-            inf_queue.put_nowait((frame, fps, skipped_frames))
+        if enable_inference:
+            if not inf_queue.full() and (ann_frame_queue is None or not ann_frame_queue.full()):
+                inf_queue.put_nowait((frame, fps, skipped_frames))
+                if ann_frame_queue is not None:
+                    ann_frame_queue.put_nowait((frame, fps, skipped_frames))
                 
     if cap: cap.release()
 
@@ -331,7 +330,7 @@ def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_
             if not running_event.is_set() and queue_obj.empty(): break
     if writer: writer.release()
 
-def ann_writer_worker(ann_queue, ui_queue, output_path, running_event):
+def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, output_path, running_event):
     """
     Highly robust generic bounds mapping directly towards duplicating skipped loops.
     Strictly deadlock-free! 
@@ -341,7 +340,21 @@ def ann_writer_worker(ann_queue, ui_queue, output_path, running_event):
         try:
             item = ann_queue.get(timeout=0.2)
             if item is None: break
-            frame, skipped_frames, active_faces, input_fps = item
+            boxes, ids, names, skipped_frames, active_faces, input_fps = item
+                
+            try:
+                frame_item = ann_frame_queue.get(timeout=0.2)
+                frame, _, _ = frame_item
+            except queue.Empty:
+                continue
+
+            for i in range(len(ids)):
+                box = boxes[i]
+                t_id = ids[i]
+                name = names[i]
+                color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
+                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
             if writer is None:
                 h, w = frame.shape[:2]
@@ -509,19 +522,21 @@ class AttendanceApp(ctk.CTk):
                 self.cam1_inf_q = mp.Queue(maxsize=30)
                 self.cam1_ann_q = mp.Queue(maxsize=150)
                 self.cam1_cmd_q = mp.Queue()
+                self.cam1_ann_frame_q = queue.Queue(maxsize=30)
             else:
                 self.cam1_inf_q = None
                 self.cam1_ann_q = None
                 self.cam1_cmd_q = None
+                self.cam1_ann_frame_q = None
                 
-            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, mode1)))
+            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.cam1_ann_frame_q, mode1)))
             self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, selected_cam1_presets, p_info['cam1'])))
             
             if mode1:
                 self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
                 self.ml_p1.daemon = True; self.ml_p1.start()
                 self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, False)))
-                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)))
+                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ann_frame_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)))
             else:
                 self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, True)))
 
@@ -533,19 +548,21 @@ class AttendanceApp(ctk.CTk):
                 self.cam2_inf_q = mp.Queue(maxsize=30)
                 self.cam2_ann_q = mp.Queue(maxsize=150)
                 self.cam2_cmd_q = mp.Queue()
+                self.cam2_ann_frame_q = queue.Queue(maxsize=30)
             else:
                 self.cam2_inf_q = None
                 self.cam2_ann_q = None
                 self.cam2_cmd_q = None
+                self.cam2_ann_frame_q = None
                 
-            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, mode2)))
+            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.cam2_ann_frame_q, mode2)))
             self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, selected_cam2_presets, p_info['cam2'])))
             
             if mode2:
                 self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
                 self.ml_p2.daemon = True; self.ml_p2.start()
                 self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, False)))
-                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)))
+                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ann_frame_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)))
             else:
                 self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, True)))
 
