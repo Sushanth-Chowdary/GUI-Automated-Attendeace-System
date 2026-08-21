@@ -35,7 +35,10 @@ PROTOCOLS = {
     2: {"name": "10-Minute", "cam1": 70, "cam2": 95},
     3: {"name": "15-Minute", "cam1": 107, "cam2": 145},
     4: {"name": "20-Minute", "cam1": 145, "cam2": 195},
-    5: {"name": "25-Minute", "cam1": 182, "cam2": 245}
+    5: {"name": "25-Minute", "cam1": 182, "cam2": 245},
+    6: {"name": "30-Minute", "cam1": 220, "cam2": 295},
+    7: {"name": "35-Minute", "cam1": 257, "cam2": 345},
+    8: {"name": "40-Minute", "cam1": 295, "cam2": 395}
 }
 
 CONFIDENCE_THRESHOLD = 0.79
@@ -419,11 +422,16 @@ class AttendanceApp(ctk.CTk):
         self.global_live_tracking_switch = ctk.CTkSwitch(self.sidebar_frame, text="Live Tracking", variable=self.global_live_tracking_var)
         self.global_live_tracking_switch.pack(pady=(15,0), padx=20, anchor="w")
         
-        self.protocol_label = ctk.CTkLabel(self.sidebar_frame, text="Execution Iteration:")
+        self.protocol_label = ctk.CTkLabel(self.sidebar_frame, text="Execution Protocol:")
         self.protocol_label.pack(pady=(15,0), padx=20, anchor="w")
-        for p, info in PROTOCOLS.items():
-            rb = ctk.CTkRadioButton(self.sidebar_frame, text=f"{info['name']} Protocol", variable=self.selected_protocol, value=p)
-            rb.pack(pady=5, padx=20, anchor="w")
+        self.protocol_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.protocol_frame.pack(pady=5, padx=20, fill="x")
+        
+        for idx, (p, info) in enumerate(PROTOCOLS.items()):
+            r = idx // 2
+            c = idx % 2
+            rb = ctk.CTkRadioButton(self.protocol_frame, text=info['name'], variable=self.selected_protocol, value=p)
+            rb.grid(row=r, column=c, pady=5, padx=5, sticky="w")
             
         self.ptz_label1 = ctk.CTkLabel(self.sidebar_frame, text="Cam1 Presets:")
         self.ptz_label1.pack(pady=(10,0), padx=20, anchor="w")
@@ -458,6 +466,8 @@ class AttendanceApp(ctk.CTk):
         btn_right = ctk.CTkButton(self.manual_ptz_frame, text="Right", width=50, command=lambda: self.manual_ptz("right"))
         btn_zi = ctk.CTkButton(self.manual_ptz_frame, text="Zoom In", width=50, command=lambda: self.manual_ptz("zoomin"))
         btn_zo = ctk.CTkButton(self.manual_ptz_frame, text="Zoom Out", width=50, command=lambda: self.manual_ptz("zoomout"))
+        btn_fi = ctk.CTkButton(self.manual_ptz_frame, text="Focus In", width=50, command=lambda: self.manual_ptz("focusin"))
+        btn_fo = ctk.CTkButton(self.manual_ptz_frame, text="Focus Out", width=50, command=lambda: self.manual_ptz("focusout"))
 
         btn_up.grid(row=0, column=1, padx=2, pady=2)
         btn_down.grid(row=2, column=1, padx=2, pady=2)
@@ -465,6 +475,8 @@ class AttendanceApp(ctk.CTk):
         btn_right.grid(row=1, column=2, padx=2, pady=2)
         btn_zi.grid(row=0, column=3, padx=2, pady=2)
         btn_zo.grid(row=2, column=3, padx=2, pady=2)
+        btn_fi.grid(row=0, column=4, padx=2, pady=2)
+        btn_fo.grid(row=2, column=4, padx=2, pady=2)
             
         self.start_btn = ctk.CTkButton(self.sidebar_frame, text="Execute Bound Loop", command=self.start_tracking)
         self.start_btn.pack(pady=20, padx=20)
