@@ -136,7 +136,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         current_active_faces = 0
 
         if index is not None and len(target_names) > 0:
-            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, half=use_half, imgsz=640)
+            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=use_half, imgsz=640)
             has_detections = results[0].boxes.id is not None
             
             if has_detections:
