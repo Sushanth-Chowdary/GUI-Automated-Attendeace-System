@@ -460,14 +460,23 @@ class AttendanceApp(ctk.CTk):
         self.manual_ptz_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
         self.manual_ptz_frame.pack(pady=5, padx=20, fill="x")
         
-        btn_up = ctk.CTkButton(self.manual_ptz_frame, text="Up", width=50, command=lambda: self.manual_ptz("up"))
-        btn_down = ctk.CTkButton(self.manual_ptz_frame, text="Down", width=50, command=lambda: self.manual_ptz("down"))
-        btn_left = ctk.CTkButton(self.manual_ptz_frame, text="Left", width=50, command=lambda: self.manual_ptz("left"))
-        btn_right = ctk.CTkButton(self.manual_ptz_frame, text="Right", width=50, command=lambda: self.manual_ptz("right"))
-        btn_zi = ctk.CTkButton(self.manual_ptz_frame, text="Zoom In", width=50, command=lambda: self.manual_ptz("zoomin"))
-        btn_zo = ctk.CTkButton(self.manual_ptz_frame, text="Zoom Out", width=50, command=lambda: self.manual_ptz("zoomout"))
-        btn_fi = ctk.CTkButton(self.manual_ptz_frame, text="Focus In", width=50, command=lambda: self.manual_ptz("focusin"))
-        btn_fo = ctk.CTkButton(self.manual_ptz_frame, text="Focus Out", width=50, command=lambda: self.manual_ptz("focusout"))
+        btn_up = ctk.CTkButton(self.manual_ptz_frame, text="Up", width=50)
+        btn_down = ctk.CTkButton(self.manual_ptz_frame, text="Down", width=50)
+        btn_left = ctk.CTkButton(self.manual_ptz_frame, text="Left", width=50)
+        btn_right = ctk.CTkButton(self.manual_ptz_frame, text="Right", width=50)
+        btn_zi = ctk.CTkButton(self.manual_ptz_frame, text="Zoom In", width=50)
+        btn_zo = ctk.CTkButton(self.manual_ptz_frame, text="Zoom Out", width=50)
+        btn_fi = ctk.CTkButton(self.manual_ptz_frame, text="Focus In", width=50)
+        btn_fo = ctk.CTkButton(self.manual_ptz_frame, text="Focus Out", width=50)
+
+        for btn, cmd in [
+            (btn_up, "up"), (btn_down, "down"), (btn_left, "left"), 
+            (btn_right, "right"), (btn_zi, "zoomin"), (btn_zo, "zoomout"), 
+            (btn_fi, "focusin"), (btn_fo, "focusout")
+        ]:
+            for widget in [btn, btn._canvas, btn._text_label]:
+                widget.bind("<ButtonPress-1>", lambda e, c=cmd: self.manual_ptz(c))
+                widget.bind("<ButtonRelease-1>", lambda e: self.manual_ptz("ptzstop"))
 
         btn_up.grid(row=0, column=1, padx=2, pady=2)
         btn_down.grid(row=2, column=1, padx=2, pady=2)
@@ -625,6 +634,8 @@ class AttendanceApp(ctk.CTk):
         ip = CAMERA_IP_1 if target == "Camera 1" else CAMERA_IP_2
         url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&{command}"
         def send_cmd():
+            if command == 'ptzstop':
+                time.sleep(0.1)
             try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
             except: pass
         threading.Thread(target=send_cmd).start()
@@ -673,7 +684,7 @@ class AttendanceApp(ctk.CTk):
                 self.frames_rendered += 1
                 frame_rgb = cv2.cvtColor(target_frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(frame_rgb)
-                imgtk = ImageTk.PhotoImage(image=img)
+                imgtk = ctk.CTkImage(light_image=img, dark_image=img, size=(1024, 576))
                 self.video_frame.configure(image=imgtk, text="")
                 self.video_frame.image = imgtk
                 
