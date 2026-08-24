@@ -151,7 +151,8 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                     if t_id not in active_track_memory:
                         active_track_memory[t_id] = {
                             'start_time': format_timestamp(frame_count, fps),
-                            'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0
+                            'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
+                            'crop_buffer': []
                         }
                     active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
 
@@ -169,8 +170,13 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                         crop = crop_standard(frame, boxes[i])
                         if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_16S).var() > 5.0:
                             resized = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
-                            batch_tensors.append(resized)
-                            batch_track_ids.append(t_id)
+                            
+                            active_track_memory[t_id]['crop_buffer'].append(resized)
+                            
+                            if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
+                                batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
+                                batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
+                                active_track_memory[t_id]['crop_buffer'] = []
                     
                     if batch_tensors:
                         with torch.inference_mode():
@@ -333,12 +339,32 @@ def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_
             if not running_event.is_set() and queue_obj.empty(): break
     if writer: writer.release()
 
-def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, output_path, running_event):
+def async_video_writer_worker(writer_queue, output_path, running_event):
+    writer = None
+    while True:
+        try:
+            item = writer_queue.get(timeout=0.2)
+            if item is None: break
+            frame, input_fps, duplicates = item
+            
+            if writer is None:
+                h, w = frame.shape[:2]
+                fps = input_fps if input_fps > 0 else 30
+                writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                
+            for _ in range(duplicates):
+                writer.write(frame)
+                
+        except queue.Empty:
+            if not running_event.is_set() and writer_queue.empty(): break
+            
+    if writer: writer.release()
+
+def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, running_event):
     """
     Highly robust generic bounds mapping directly towards duplicating skipped loops.
     Strictly deadlock-free! 
     """
-    writer = None
     while True:
         try:
             item = ann_queue.get(timeout=0.2)
@@ -359,14 +385,8 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, output_path, running
                 cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
                 cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
-            if writer is None:
-                h, w = frame.shape[:2]
-                fps = input_fps if input_fps > 0 else 30
-                writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                
-            # EXECUTE FRAME PADDING AVOIDING SPED UP PHENOMENON unconditionally avoiding dropped timing errors natively
-            for _ in range(skipped_frames + 1):
-                writer.write(frame)
+            if not writer_queue.full():
+                writer_queue.put_nowait((frame, input_fps, skipped_frames + 1))
                 
             if not ui_queue.full():
                 ui_frame = cv2.resize(frame, (1024, 576))
@@ -374,8 +394,6 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, output_path, running
                 
         except queue.Empty:
             if not running_event.is_set() and ann_queue.empty(): break
-            
-    if writer: writer.release()
 
 
 # ==========================================
@@ -544,11 +562,13 @@ class AttendanceApp(ctk.CTk):
                 self.cam1_ann_q = mp.Queue(maxsize=150)
                 self.cam1_cmd_q = mp.Queue()
                 self.cam1_ann_frame_q = queue.Queue(maxsize=30)
+                self.cam1_writer_q = queue.Queue(maxsize=150)
             else:
                 self.cam1_inf_q = None
                 self.cam1_ann_q = None
                 self.cam1_cmd_q = None
                 self.cam1_ann_frame_q = None
+                self.cam1_writer_q = None
                 
             self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.cam1_ann_frame_q, mode1)))
             self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, selected_cam1_presets, p_info['cam1'])))
@@ -557,7 +577,8 @@ class AttendanceApp(ctk.CTk):
                 self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
                 self.ml_p1.daemon = True; self.ml_p1.start()
                 self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, False)))
-                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ann_frame_q, self.cam1_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)))
+                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ann_frame_q, self.cam1_ui_q, self.cam1_writer_q, self.running_event)))
+                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam1_writer_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)))
             else:
                 self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, True)))
 
@@ -570,11 +591,13 @@ class AttendanceApp(ctk.CTk):
                 self.cam2_ann_q = mp.Queue(maxsize=150)
                 self.cam2_cmd_q = mp.Queue()
                 self.cam2_ann_frame_q = queue.Queue(maxsize=30)
+                self.cam2_writer_q = queue.Queue(maxsize=150)
             else:
                 self.cam2_inf_q = None
                 self.cam2_ann_q = None
                 self.cam2_cmd_q = None
                 self.cam2_ann_frame_q = None
+                self.cam2_writer_q = None
                 
             self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.cam2_ann_frame_q, mode2)))
             self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, selected_cam2_presets, p_info['cam2'])))
@@ -583,7 +606,8 @@ class AttendanceApp(ctk.CTk):
                 self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
                 self.ml_p2.daemon = True; self.ml_p2.start()
                 self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, False)))
-                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ann_frame_q, self.cam2_ui_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)))
+                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ann_frame_q, self.cam2_ui_q, self.cam2_writer_q, self.running_event)))
+                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam2_writer_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)))
             else:
                 self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, True)))
 
@@ -605,6 +629,11 @@ class AttendanceApp(ctk.CTk):
             self.cam1_ann_q.put(None)
         if hasattr(self, 'cam2_ann_q') and self.cam2_ann_q:
             self.cam2_ann_q.put(None)
+            
+        if hasattr(self, 'cam1_writer_q') and self.cam1_writer_q:
+            self.cam1_writer_q.put(None)
+        if hasattr(self, 'cam2_writer_q') and self.cam2_writer_q:
+            self.cam2_writer_q.put(None)
             
         if hasattr(self, 'cam1_raw_q') and self.cam1_raw_q:
             self.cam1_raw_q.put(None)
