@@ -139,7 +139,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         current_active_faces = 0
 
         if index is not None and len(target_names) > 0:
-            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=use_half, imgsz=640)
+            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=16 if use_half else None, imgsz=640)
             has_detections = results[0].boxes.id is not None
             
             if has_detections:
@@ -168,7 +168,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                             continue
 
                         crop = crop_standard(frame, boxes[i])
-                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_16S).var() > 5.0:
+                        if crop.size > 0:
                             resized = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
                             
                             active_track_memory[t_id]['crop_buffer'].append(resized)
@@ -183,22 +183,36 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                             batch_array = np.stack(batch_tensors, axis=0)
                             batch_tensor = torch.from_numpy(batch_array).to(device, non_blocking=True).float()
                             batch_tensor = batch_tensor.permute(0, 3, 1, 2)[:, [2, 1, 0], :, :]
-                            batch_tensor = (batch_tensor / 127.5) - 1.0
-                            if use_half:
-                                batch_tensor = batch_tensor.half()
-                            embeddings = resnet(batch_tensor).cpu().numpy().astype('float32')
-                        faiss.normalize_L2(embeddings)
-                        sims, indices = index.search(embeddings, k=1)
-                        for i, t_id in enumerate(batch_track_ids):
-                            name = target_names[y_real[indices[i][0]]] if sims[i][0] > CONFIDENCE_THRESHOLD else "Unknown"
-                            active_track_memory[t_id]['buffer'].append(name)
-                            active_track_memory[t_id]['all_preds'].append(name)
                             
-                            if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                                valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
-                                winner = Counter(valid_history).most_common(1)[0][0] if valid_history else "Unknown"
-                                track_identities[t_id] = winner
-                                active_track_memory[t_id]['buffer'] = []
+                            # GPU Vectorized Blur Filtering
+                            gray = 0.2989 * batch_tensor[:, 0:1, :, :] + 0.5870 * batch_tensor[:, 1:2, :, :] + 0.1140 * batch_tensor[:, 2:3, :, :]
+                            laplacian_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
+                            laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
+                            laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
+                            
+                            mask = laplacian_var > 5.0
+                            mask_list = mask.cpu().tolist()
+                            valid_batch_tensor = batch_tensor[mask]
+                            valid_batch_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if mask_list[k]]
+                            
+                            if valid_batch_tensor.size(0) > 0:
+                                valid_batch_tensor = (valid_batch_tensor / 127.5) - 1.0
+                                if use_half:
+                                    valid_batch_tensor = valid_batch_tensor.half()
+                                embeddings = resnet(valid_batch_tensor).cpu().numpy().astype('float32')
+                                faiss.normalize_L2(embeddings)
+                                sims, indices = index.search(embeddings, k=1)
+                                
+                                for i, t_id in enumerate(valid_batch_track_ids):
+                                    name = target_names[y_real[indices[i][0]]] if sims[i][0] > CONFIDENCE_THRESHOLD else "Unknown"
+                                    active_track_memory[t_id]['buffer'].append(name)
+                                    active_track_memory[t_id]['all_preds'].append(name)
+                                    
+                                    if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
+                                        valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
+                                        winner = Counter(valid_history).most_common(1)[0][0] if valid_history else "Unknown"
+                                        track_identities[t_id] = winner
+                                        active_track_memory[t_id]['buffer'] = []
 
                 # Collect tracking metadata instead of drawing on frames directly
                 for i in range(len(ids)):
@@ -432,9 +446,13 @@ class AttendanceApp(ctk.CTk):
         self.view_toggle = ctk.CTkSegmentedButton(self.sidebar_frame, values=["Camera 1", "Camera 2"], variable=self.view_target)
         self.view_toggle.pack(pady=10, padx=20, fill="x")
 
-        self.camera_selection_var = ctk.StringVar(value="Both Cameras")
-        self.camera_selection_toggle = ctk.CTkSegmentedButton(self.sidebar_frame, values=["Camera 1 Only", "Camera 2 Only", "Both Cameras"], variable=self.camera_selection_var)
-        self.camera_selection_toggle.pack(pady=10, padx=20, fill="x")
+        self.cam1_enable_var = ctk.BooleanVar(value=True)
+        self.cam1_enable_switch = ctk.CTkSwitch(self.sidebar_frame, text="Enable Camera 1", variable=self.cam1_enable_var)
+        self.cam1_enable_switch.pack(pady=(10, 0), padx=20, anchor="w")
+        
+        self.cam2_enable_var = ctk.BooleanVar(value=True)
+        self.cam2_enable_switch = ctk.CTkSwitch(self.sidebar_frame, text="Enable Camera 2", variable=self.cam2_enable_var)
+        self.cam2_enable_switch.pack(pady=10, padx=20, anchor="w")
 
         self.global_live_tracking_var = ctk.BooleanVar(value=True)
         self.global_live_tracking_switch = ctk.CTkSwitch(self.sidebar_frame, text="Live Tracking", variable=self.global_live_tracking_var)
@@ -538,9 +556,15 @@ class AttendanceApp(ctk.CTk):
         selected_cam1_presets = [p for p, var in self.cam1_preset_vars.items() if var.get()]
         selected_cam2_presets = [p for p, var in self.cam2_preset_vars.items() if var.get()]
         
-        cam_selection = self.camera_selection_var.get()
-        use_cam1 = cam_selection in ["Camera 1 Only", "Both Cameras"]
-        use_cam2 = cam_selection in ["Camera 2 Only", "Both Cameras"]
+        use_cam1 = self.cam1_enable_var.get()
+        use_cam2 = self.cam2_enable_var.get()
+        
+        if not use_cam1 and not use_cam2:
+            print("[Warning] Both cameras disabled. Cannot start tracking.")
+            self.start_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            self.running_event.clear()
+            return
         
         global_track = self.global_live_tracking_var.get()
         mode1 = global_track
