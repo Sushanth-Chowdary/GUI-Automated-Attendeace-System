@@ -141,138 +141,148 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         except FileNotFoundError:
             # Frame expired and was cleaned up by the reader during model warm-up; skip it
             continue
-        frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_inf.buf)
-        
-        frame_count += (skipped_frames + 1)
-        fps = input_fps if input_fps > 0 else 30
-        
-        # Deadlock Elimination: Collect tracking metadata strictly decoupled from UI loop drawing frames globally
-        metadata = {'boxes': [], 'ids': [], 'names': []}
-        current_active_faces = 0
-
-        if (db_tensor is not None or index is not None) and len(target_names) > 0:
-            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=16 if use_half else None, imgsz=640)
-            has_detections = results[0].boxes.id is not None
             
-            if has_detections:
-                boxes = results[0].boxes.xyxy
-                ids = results[0].boxes.id.int()
-                current_active_faces = len(ids)
+        try:
+            frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_inf.buf)
+            
+            frame_count += (skipped_frames + 1)
+            fps = input_fps if input_fps > 0 else 30
+            
+            # Deadlock Elimination: Collect tracking metadata strictly decoupled from UI loop drawing frames globally
+            metadata = {'boxes': [], 'ids': [], 'names': []}
+            current_active_faces = 0
+
+            if (db_tensor is not None or index is not None) and len(target_names) > 0:
+                results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, half=use_half, imgsz=640)
+                has_detections = results[0].boxes.id is not None
                 
-                alive_ids = ids.cpu().numpy().tolist()
-                for t_id in alive_ids:
-                    if t_id not in active_track_memory:
-                        active_track_memory[t_id] = {
-                            'start_time': format_timestamp(frame_count, fps),
-                            'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
-                            'crop_buffer': []
-                        }
-                    active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
-
-                if frame_count % FRAME_SKIP == 0 or (frame_count - skipped_frames) % FRAME_SKIP == 0:
-                    w = boxes[:, 2] - boxes[:, 0]
-                    h = boxes[:, 3] - boxes[:, 1]
-                    aspect_ratio = w / torch.clamp(h, min=1e-6)
-                    valid_mask = (w >= 65) & (h >= 65) & (aspect_ratio >= 0.55) & (aspect_ratio <= 1.55)
+                if has_detections:
+                    boxes = results[0].boxes.xyxy
+                    ids = results[0].boxes.id.int()
+                    current_active_faces = len(ids)
                     
-                    valid_indices = torch.where(valid_mask)[0]
-                    if len(valid_indices) > 0:
-                        v_boxes = boxes[valid_indices]
-                        v_ids = ids[valid_indices].cpu().numpy().tolist()
+                    alive_ids = ids.cpu().numpy().tolist()
+                    for t_id in alive_ids:
+                        if t_id not in active_track_memory:
+                            active_track_memory[t_id] = {
+                                'start_time': format_timestamp(frame_count, fps),
+                                'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
+                                'crop_buffer': []
+                            }
+                        active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
+
+                    if frame_count % FRAME_SKIP == 0 or (frame_count - skipped_frames) % FRAME_SKIP == 0:
+                        w = boxes[:, 2] - boxes[:, 0]
+                        h = boxes[:, 3] - boxes[:, 1]
+                        aspect_ratio = w / torch.clamp(h, min=1e-6)
+                        valid_mask = (w >= 65) & (h >= 65) & (aspect_ratio >= 0.55) & (aspect_ratio <= 1.55)
                         
-                        vw = v_boxes[:, 2] - v_boxes[:, 0]
-                        vh = v_boxes[:, 3] - v_boxes[:, 1]
-                        mx, my = vw * 0.15, vh * 0.15
-                        
-                        b_adj = v_boxes.clone()
-                        b_adj[:, 0] = torch.clamp(v_boxes[:, 0] - mx, min=0)
-                        b_adj[:, 1] = torch.clamp(v_boxes[:, 1] - my, min=0)
-                        b_adj[:, 2] = torch.clamp(v_boxes[:, 2] + mx, max=frame.shape[1])
-                        b_adj[:, 3] = torch.clamp(v_boxes[:, 3] + my, max=frame.shape[0])
-                        
-                        batch_idx = torch.zeros((v_boxes.size(0), 1), device=device, dtype=v_boxes.dtype)
-                        b_batch = torch.cat([batch_idx, b_adj], dim=1)
-                        
-                        frame_tensor = torch.from_numpy(frame).to(device, non_blocking=True).float().permute(2, 0, 1).unsqueeze(0)
-                        crops = ops.roi_align(frame_tensor, b_batch, output_size=(160, 160))
-                        crops_rgb = crops[:, [2, 1, 0], :, :]
-                        
-                        batch_tensors, batch_track_ids = [], []
-                        for i, t_id in enumerate(v_ids):
-                            active_track_memory[t_id]['crop_buffer'].append(crops_rgb[i])
-                            if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
-                                batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
-                                batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
-                                active_track_memory[t_id]['crop_buffer'] = []
-                                
-                        if batch_tensors:
-                            with torch.inference_mode():
-                                batch_tensor = torch.stack(batch_tensors, dim=0)
-                                gray = TF.rgb_to_grayscale(batch_tensor)
-                                lap_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
-                                lap_out = torch.nn.functional.conv2d(gray, lap_kernel, padding=1)
-                                lap_var = torch.var(lap_out, dim=(1, 2, 3))
-                                
-                                mask = lap_var > 5.0
-                                valid_batch = batch_tensor[mask]
-                                m_list = mask.cpu().tolist()
-                                v_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if m_list[k]]
-                                
-                                if valid_batch.size(0) > 0:
-                                    valid_batch = (valid_batch / 127.5) - 1.0
-                                    if use_half: valid_batch = valid_batch.half()
+                        valid_indices = torch.where(valid_mask)[0]
+                        if len(valid_indices) > 0:
+                            v_boxes = boxes[valid_indices]
+                            v_ids = ids[valid_indices].cpu().numpy().tolist()
+                            
+                            vw = v_boxes[:, 2] - v_boxes[:, 0]
+                            vh = v_boxes[:, 3] - v_boxes[:, 1]
+                            mx, my = vw * 0.15, vh * 0.15
+                            
+                            b_adj = v_boxes.clone()
+                            b_adj[:, 0] = torch.clamp(v_boxes[:, 0] - mx, min=0)
+                            b_adj[:, 1] = torch.clamp(v_boxes[:, 1] - my, min=0)
+                            b_adj[:, 2] = torch.clamp(v_boxes[:, 2] + mx, max=frame.shape[1])
+                            b_adj[:, 3] = torch.clamp(v_boxes[:, 3] + my, max=frame.shape[0])
+                            
+                            batch_idx = torch.zeros((v_boxes.size(0), 1), device=device, dtype=v_boxes.dtype)
+                            b_batch = torch.cat([batch_idx, b_adj], dim=1)
+                            
+                            frame_tensor = torch.from_numpy(frame).to(device, non_blocking=True).float().permute(2, 0, 1).unsqueeze(0)
+                            crops = ops.roi_align(frame_tensor, b_batch, output_size=(160, 160))
+                            crops_rgb = crops[:, [2, 1, 0], :, :]
+                            
+                            batch_tensors, batch_track_ids = [], []
+                            for i, t_id in enumerate(v_ids):
+                                active_track_memory[t_id]['crop_buffer'].append(crops_rgb[i])
+                                if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
+                                    batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
+                                    batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
+                                    active_track_memory[t_id]['crop_buffer'] = []
                                     
-                                    emb = resnet(valid_batch)
-                                    emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+                            if batch_tensors:
+                                with torch.inference_mode():
+                                    batch_tensor = torch.stack(batch_tensors, dim=0)
+                                    gray = TF.rgb_to_grayscale(batch_tensor)
+                                    lap_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
+                                    lap_out = torch.nn.functional.conv2d(gray, lap_kernel, padding=1)
+                                    lap_var = torch.var(lap_out, dim=(1, 2, 3))
                                     
-                                    if db_tensor is not None:
-                                        sims = torch.mm(emb, db_tensor.t())
-                                        max_sims, max_indices = torch.max(sims, dim=1)
-                                        m_sims_vals = max_sims.cpu().tolist()
-                                        m_idx_vals = max_indices.cpu().tolist()
-                                    else:
-                                        emb_cpu = emb.float().cpu().numpy()
-                                        sims_res, indices_res = index.search(emb_cpu, k=1)
-                                        m_sims_vals = [float(s[0]) for s in sims_res]
-                                        m_idx_vals = [int(idx[0]) for idx in indices_res]
+                                    mask = lap_var > 5.0
+                                    valid_batch = batch_tensor[mask]
+                                    m_list = mask.cpu().tolist()
+                                    v_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if m_list[k]]
                                     
-                                    for i, t_id in enumerate(v_track_ids):
-                                        name = target_names[y_real[m_idx_vals[i]]] if m_sims_vals[i] > CONFIDENCE_THRESHOLD else "Unknown"
-                                        active_track_memory[t_id]['buffer'].append(name)
-                                        active_track_memory[t_id]['all_preds'].append(name)
+                                    if valid_batch.size(0) > 0:
+                                        valid_batch = (valid_batch / 127.5) - 1.0
+                                        if use_half: 
+                                            valid_batch = valid_batch.half()
+                                        else:
+                                            valid_batch = valid_batch.float()
                                         
-                                        if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                                            v_hist = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
-                                            winner = Counter(v_hist).most_common(1)[0][0] if v_hist else "Unknown"
-                                            track_identities[t_id] = winner
-                                            active_track_memory[t_id]['buffer'] = []
+                                        emb = resnet(valid_batch)
+                                        emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+                                        
+                                        if db_tensor is not None:
+                                            db_tensor_cast = db_tensor.to(emb.dtype)
+                                            sims = torch.mm(emb, db_tensor_cast.t())
+                                            max_sims, max_indices = torch.max(sims, dim=1)
+                                            m_sims_vals = max_sims.cpu().tolist()
+                                            m_idx_vals = max_indices.cpu().tolist()
+                                        else:
+                                            emb_cpu = emb.float().cpu().numpy()
+                                            sims_res, indices_res = index.search(emb_cpu, k=1)
+                                            m_sims_vals = [float(s[0]) for s in sims_res]
+                                            m_idx_vals = [int(idx[0]) for idx in indices_res]
+                                        
+                                        for i, t_id in enumerate(v_track_ids):
+                                            name = target_names[y_real[m_idx_vals[i]]] if m_sims_vals[i] > CONFIDENCE_THRESHOLD else "Unknown"
+                                            active_track_memory[t_id]['buffer'].append(name)
+                                            active_track_memory[t_id]['all_preds'].append(name)
+                                            
+                                            if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
+                                                v_hist = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
+                                                winner = Counter(v_hist).most_common(1)[0][0] if v_hist else "Unknown"
+                                                track_identities[t_id] = winner
+                                                active_track_memory[t_id]['buffer'] = []
 
-                meta_boxes = boxes.cpu().numpy().tolist()
-                for i in range(len(alive_ids)):
-                    t_id = alive_ids[i]
-                    metadata['boxes'].append(meta_boxes[i])
-                    metadata['ids'].append(t_id)
-                    metadata['names'].append(track_identities.get(t_id, "Analyzing..."))
+                    meta_boxes = boxes.cpu().numpy().tolist()
+                    for i in range(len(alive_ids)):
+                        t_id = alive_ids[i]
+                        metadata['boxes'].append(meta_boxes[i])
+                        metadata['ids'].append(t_id)
+                        metadata['names'].append(track_identities.get(t_id, "Analyzing..."))
 
-                alive_set = set(alive_ids)
-                for t_id in list(active_track_memory.keys()):
-                    if t_id not in alive_set:
-                        active_track_memory[t_id]['missing_frames'] += (skipped_frames + 1)
-                        if active_track_memory[t_id]['missing_frames'] > 50:
-                            archived_tracks[t_id] = active_track_memory.pop(t_id)
-                    else:
-                        active_track_memory[t_id]['missing_frames'] = 0
+                    alive_set = set(alive_ids)
+                    for t_id in list(active_track_memory.keys()):
+                        if t_id not in alive_set:
+                            active_track_memory[t_id]['missing_frames'] += (skipped_frames + 1)
+                            if active_track_memory[t_id]['missing_frames'] > 50:
+                                archived_tracks[t_id] = active_track_memory.pop(t_id)
+                        else:
+                            active_track_memory[t_id]['missing_frames'] = 0
 
-        try:
-            ann_queue.put((metadata['boxes'], metadata['ids'], metadata['names'], skipped_frames, current_active_faces, fps), timeout=0.2)
-        except queue.Full:
-            pass
+            try:
+                ann_queue.put((metadata['boxes'], metadata['ids'], metadata['names'], skipped_frames, current_active_faces, fps), timeout=0.2)
+            except queue.Full:
+                pass
+                
+        except Exception as e:
+            print(f"[ML PROCESS | {cam_name}] Error in execution loop: {e}")
             
-        try:
-            shm_inf.close()
-            shm_inf.unlink()
-        except (FileNotFoundError, BufferError, Exception):
-            pass
+        finally:
+            try:
+                shm_inf.close()
+                shm_inf.unlink()
+            except (FileNotFoundError, BufferError, Exception):
+                pass
 
     # ==========================
     # FINAL ATTENDANCE SECURE DUMP
@@ -453,15 +463,21 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
             if item is None: break
             boxes, ids, names, skipped_frames, active_faces, input_fps = item
                 
+            frame_copy = None
             try:
                 frame_item = ann_frame_queue.get(timeout=0.2)
                 meta, _, _ = frame_item
                 try:
                     shm_ann = shared_memory.SharedMemory(name=meta['name'])
+                    frame_buffer = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_ann.buf)
+                    frame_copy = frame_buffer.copy()
+                    shm_ann.close()
                 except FileNotFoundError:
-                    continue
-                frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_ann.buf)
+                    pass
             except queue.Empty:
+                pass
+
+            if frame_copy is None:
                 continue
 
             for i in range(len(ids)):
@@ -469,22 +485,16 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
                 t_id = ids[i]
                 name = names[i]
                 color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
-                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-                cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.rectangle(frame_copy, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                cv2.putText(frame_copy, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
-            frame_copy = frame.copy()
             if not writer_queue.full():
                 writer_queue.put_nowait((frame_copy, input_fps, skipped_frames + 1))
                 
             if not ui_queue.full():
-                ui_frame = cv2.resize(frame, (1024, 576))
+                ui_frame = cv2.resize(frame_copy, (1024, 576))
                 ui_queue.put_nowait((ui_frame, active_faces))
                 
-            try:
-                shm_ann.close()
-                shm_ann.unlink()
-            except (FileNotFoundError, BufferError, Exception):
-                pass
         except queue.Empty:
             if not running_event.is_set() and ann_queue.empty(): break
 
