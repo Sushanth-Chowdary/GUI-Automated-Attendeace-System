@@ -16,8 +16,11 @@ import numpy as np
 import torchvision.transforms as transforms
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
-from requests.auth import HTTPBasicAuth
+from multiprocessing import shared_memory
 import multiprocessing as mp
+import torchvision.ops as ops
+import torchvision.transforms.functional as TF
+from requests.auth import HTTPBasicAuth
 
 # ==========================================
 # CONFIGURATION
@@ -58,16 +61,6 @@ def format_timestamp(frame_count, fps):
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def crop_standard(img, box):
-    x1, y1, x2, y2 = map(int, box)
-    w, h = x2 - x1, y2 - y1
-    margin_x, margin_y = int(w * 0.15), int(h * 0.15)
-    x1 = max(0, x1 - margin_x)
-    y1 = max(0, y1 - margin_y)
-    x2 = min(img.shape[1], x2 + margin_x)
-    y2 = min(img.shape[0], y2 + margin_y)
-    return img[y1:y2, x1:x2]
-
 
 
 # ==========================================
@@ -92,9 +85,17 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         faiss_index_path = './face_attendance_faiss.bin'
         if os.path.exists(faiss_index_path):
             index = faiss.read_index(faiss_index_path)
-            index.nprobe = 20
+            try:
+                db_embeddings = np.zeros((index.ntotal, index.d), dtype=np.float32)
+                for i in range(index.ntotal):
+                    db_embeddings[i] = index.reconstruct(i)
+                db_tensor = torch.from_numpy(db_embeddings).to(device)
+                db_tensor = torch.nn.functional.normalize(db_tensor, p=2, dim=1)
+            except Exception as e:
+                print(f"Failed to reconstruct faiss index: {e}")
+                db_tensor = None
         else:
-            index = None
+            db_tensor = None
             
         meta_path = './face_attendance_meta.pkl'
         if os.path.exists(meta_path):
@@ -129,7 +130,9 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         except queue.Empty:
             continue
             
-        frame, input_fps, skipped_frames = item
+        meta, input_fps, skipped_frames = item
+        shm_inf = shared_memory.SharedMemory(name=meta['name'])
+        frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_inf.buf)
         
         frame_count += (skipped_frames + 1)
         fps = input_fps if input_fps > 0 else 30
@@ -138,16 +141,17 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         metadata = {'boxes': [], 'ids': [], 'names': []}
         current_active_faces = 0
 
-        if index is not None and len(target_names) > 0:
+        if db_tensor is not None and len(target_names) > 0:
             results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=16 if use_half else None, imgsz=640)
             has_detections = results[0].boxes.id is not None
             
             if has_detections:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                ids = results[0].boxes.id.int().cpu().numpy()
+                boxes = results[0].boxes.xyxy
+                ids = results[0].boxes.id.int()
                 current_active_faces = len(ids)
                 
-                for t_id in ids:
+                alive_ids = ids.cpu().numpy().tolist()
+                for t_id in alive_ids:
                     if t_id not in active_track_memory:
                         active_track_memory[t_id] = {
                             'start_time': format_timestamp(frame_count, fps),
@@ -157,86 +161,101 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                     active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
 
                 if frame_count % FRAME_SKIP == 0 or (frame_count - skipped_frames) % FRAME_SKIP == 0:
-                    batch_tensors, batch_track_ids = [], []
-                    for i, t_id in enumerate(ids):
-                        x1, y1, x2, y2 = boxes[i]
-                        box_w, box_h = x2 - x1, y2 - y1
-                        if box_w < 65 or box_h < 65:
-                            continue
-                        aspect_ratio = box_w / box_h if box_h != 0 else 0
-                        if aspect_ratio < 0.55 or aspect_ratio > 1.55:
-                            continue
-
-                        crop = crop_standard(frame, boxes[i])
-                        if crop.size > 0:
-                            resized = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
-                            
-                            active_track_memory[t_id]['crop_buffer'].append(resized)
-                            
+                    w = boxes[:, 2] - boxes[:, 0]
+                    h = boxes[:, 3] - boxes[:, 1]
+                    aspect_ratio = w / torch.clamp(h, min=1e-6)
+                    valid_mask = (w >= 65) & (h >= 65) & (aspect_ratio >= 0.55) & (aspect_ratio <= 1.55)
+                    
+                    valid_indices = torch.where(valid_mask)[0]
+                    if len(valid_indices) > 0:
+                        v_boxes = boxes[valid_indices]
+                        v_ids = ids[valid_indices].cpu().numpy().tolist()
+                        
+                        vw = v_boxes[:, 2] - v_boxes[:, 0]
+                        vh = v_boxes[:, 3] - v_boxes[:, 1]
+                        mx, my = vw * 0.15, vh * 0.15
+                        
+                        b_adj = v_boxes.clone()
+                        b_adj[:, 0] = torch.clamp(v_boxes[:, 0] - mx, min=0)
+                        b_adj[:, 1] = torch.clamp(v_boxes[:, 1] - my, min=0)
+                        b_adj[:, 2] = torch.clamp(v_boxes[:, 2] + mx, max=frame.shape[1])
+                        b_adj[:, 3] = torch.clamp(v_boxes[:, 3] + my, max=frame.shape[0])
+                        
+                        batch_idx = torch.zeros((v_boxes.size(0), 1), device=device, dtype=v_boxes.dtype)
+                        b_batch = torch.cat([batch_idx, b_adj], dim=1)
+                        
+                        frame_tensor = torch.from_numpy(frame).to(device, non_blocking=True).float().permute(2, 0, 1).unsqueeze(0)
+                        crops = ops.roi_align(frame_tensor, b_batch, output_size=(160, 160))
+                        crops_rgb = crops[:, [2, 1, 0], :, :]
+                        
+                        batch_tensors, batch_track_ids = [], []
+                        for i, t_id in enumerate(v_ids):
+                            active_track_memory[t_id]['crop_buffer'].append(crops_rgb[i])
                             if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
                                 batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
                                 batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
                                 active_track_memory[t_id]['crop_buffer'] = []
-                    
-                    if batch_tensors:
-                        with torch.inference_mode():
-                            batch_array = np.stack(batch_tensors, axis=0)
-                            batch_tensor = torch.from_numpy(batch_array).to(device, non_blocking=True).float()
-                            batch_tensor = batch_tensor.permute(0, 3, 1, 2)[:, [2, 1, 0], :, :]
-                            
-                            # GPU Vectorized Blur Filtering
-                            gray = 0.2989 * batch_tensor[:, 0:1, :, :] + 0.5870 * batch_tensor[:, 1:2, :, :] + 0.1140 * batch_tensor[:, 2:3, :, :]
-                            laplacian_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
-                            laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
-                            laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
-                            
-                            mask = laplacian_var > 5.0
-                            mask_list = mask.cpu().tolist()
-                            valid_batch_tensor = batch_tensor[mask]
-                            valid_batch_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if mask_list[k]]
-                            
-                            if valid_batch_tensor.size(0) > 0:
-                                valid_batch_tensor = (valid_batch_tensor / 127.5) - 1.0
-                                if use_half:
-                                    valid_batch_tensor = valid_batch_tensor.half()
-                                embeddings = resnet(valid_batch_tensor).cpu().numpy().astype('float32')
-                                faiss.normalize_L2(embeddings)
-                                sims, indices = index.search(embeddings, k=1)
                                 
-                                for i, t_id in enumerate(valid_batch_track_ids):
-                                    name = target_names[y_real[indices[i][0]]] if sims[i][0] > CONFIDENCE_THRESHOLD else "Unknown"
-                                    active_track_memory[t_id]['buffer'].append(name)
-                                    active_track_memory[t_id]['all_preds'].append(name)
+                        if batch_tensors:
+                            with torch.inference_mode():
+                                batch_tensor = torch.stack(batch_tensors, dim=0)
+                                gray = TF.rgb_to_grayscale(batch_tensor)
+                                lap_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
+                                lap_out = torch.nn.functional.conv2d(gray, lap_kernel, padding=1)
+                                lap_var = torch.var(lap_out, dim=(1, 2, 3))
+                                
+                                mask = lap_var > 5.0
+                                valid_batch = batch_tensor[mask]
+                                m_list = mask.cpu().tolist()
+                                v_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if m_list[k]]
+                                
+                                if valid_batch.size(0) > 0:
+                                    valid_batch = (valid_batch / 127.5) - 1.0
+                                    if use_half: valid_batch = valid_batch.half()
                                     
-                                    if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                                        valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
-                                        winner = Counter(valid_history).most_common(1)[0][0] if valid_history else "Unknown"
-                                        track_identities[t_id] = winner
-                                        active_track_memory[t_id]['buffer'] = []
+                                    emb = resnet(valid_batch)
+                                    emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+                                    
+                                    sims = torch.mm(emb, db_tensor.t())
+                                    max_sims, max_indices = torch.max(sims, dim=1)
+                                    
+                                    m_sims_vals = max_sims.cpu().tolist()
+                                    m_idx_vals = max_indices.cpu().tolist()
+                                    
+                                    for i, t_id in enumerate(v_track_ids):
+                                        name = target_names[y_real[m_idx_vals[i]]] if m_sims_vals[i] > CONFIDENCE_THRESHOLD else "Unknown"
+                                        active_track_memory[t_id]['buffer'].append(name)
+                                        active_track_memory[t_id]['all_preds'].append(name)
+                                        
+                                        if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
+                                            v_hist = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
+                                            winner = Counter(v_hist).most_common(1)[0][0] if v_hist else "Unknown"
+                                            track_identities[t_id] = winner
+                                            active_track_memory[t_id]['buffer'] = []
 
-                # Collect tracking metadata instead of drawing on frames directly
-                for i in range(len(ids)):
-                    t_id = ids[i]
-                    box = boxes[i]
-                    name = track_identities.get(t_id, "Analyzing...")
-                    metadata['boxes'].append(box)
+                meta_boxes = boxes.cpu().numpy().tolist()
+                for i in range(len(alive_ids)):
+                    t_id = alive_ids[i]
+                    metadata['boxes'].append(meta_boxes[i])
                     metadata['ids'].append(t_id)
-                    metadata['names'].append(name)
+                    metadata['names'].append(track_identities.get(t_id, "Analyzing..."))
 
-                alive_ids = set(ids)
+                alive_set = set(alive_ids)
                 for t_id in list(active_track_memory.keys()):
-                    if t_id not in alive_ids:
+                    if t_id not in alive_set:
                         active_track_memory[t_id]['missing_frames'] += (skipped_frames + 1)
                         if active_track_memory[t_id]['missing_frames'] > 50:
                             archived_tracks[t_id] = active_track_memory.pop(t_id)
                     else:
                         active_track_memory[t_id]['missing_frames'] = 0
 
-        # Enforce highly reliable logic outputs directly to single bound queue strictly avoiding cross queue ID locks!
         try:
             ann_queue.put((metadata['boxes'], metadata['ids'], metadata['names'], skipped_frames, current_active_faces, fps), timeout=0.2)
         except queue.Full:
             pass
+            
+        shm_inf.close()
+        shm_inf.unlink()
 
     # ==========================
     # FINAL ATTENDANCE SECURE DUMP
@@ -318,14 +337,23 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue, ann_frame_queue=None, e
         
         # Raw Writer explicitly gets all original non-throttled data
         if not raw_queue.full():
-            raw_queue.put_nowait((frame, fps, skipped_frames + 1))
+            shm1 = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+            shm_arr1 = np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm1.buf)
+            shm_arr1[:] = frame[:]
+            raw_queue.put_nowait(({'name': shm1.name, 'shape': frame.shape, 'dtype': str(frame.dtype)}, fps, skipped_frames + 1))
             
         # Throttled Dispatch evaluating constraints preventing CPU Serialization overload arrays entirely
         if enable_inference:
             if not inf_queue.full() and (ann_frame_queue is None or not ann_frame_queue.full()):
-                inf_queue.put_nowait((frame, fps, skipped_frames))
+                shm2 = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+                shm_arr2 = np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm2.buf)
+                shm_arr2[:] = frame[:]
+                inf_queue.put_nowait(({'name': shm2.name, 'shape': frame.shape, 'dtype': str(frame.dtype)}, fps, skipped_frames))
                 if ann_frame_queue is not None:
-                    ann_frame_queue.put_nowait((frame, fps, skipped_frames))
+                    shm3 = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+                    shm_arr3 = np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm3.buf)
+                    shm_arr3[:] = frame[:]
+                    ann_frame_queue.put_nowait(({'name': shm3.name, 'shape': frame.shape, 'dtype': str(frame.dtype)}, fps, skipped_frames))
                 
     if cap: cap.release()
 
@@ -335,7 +363,9 @@ def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_
         try:
             item = queue_obj.get(timeout=0.2)
             if item is None: break
-            frame, input_fps, duplicates = item
+            meta, input_fps, duplicates = item
+            shm_raw = shared_memory.SharedMemory(name=meta['name'])
+            frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_raw.buf)
             
             if writer is None:
                 h, w = frame.shape[:2]
@@ -349,6 +379,9 @@ def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_
                 if not ui_queue.full():
                     ui_frame = cv2.resize(frame, (1024, 576))
                     ui_queue.put_nowait((ui_frame, 0))
+                    
+            shm_raw.close()
+            shm_raw.unlink()
         except queue.Empty:
             if not running_event.is_set() and queue_obj.empty(): break
     if writer: writer.release()
@@ -387,7 +420,9 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
                 
             try:
                 frame_item = ann_frame_queue.get(timeout=0.2)
-                frame, _, _ = frame_item
+                meta, _, _ = frame_item
+                shm_ann = shared_memory.SharedMemory(name=meta['name'])
+                frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_ann.buf)
             except queue.Empty:
                 continue
 
@@ -399,13 +434,16 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
                 cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
                 cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
+            frame_copy = frame.copy()
             if not writer_queue.full():
-                writer_queue.put_nowait((frame, input_fps, skipped_frames + 1))
+                writer_queue.put_nowait((frame_copy, input_fps, skipped_frames + 1))
                 
             if not ui_queue.full():
                 ui_frame = cv2.resize(frame, (1024, 576))
                 ui_queue.put_nowait((ui_frame, active_faces))
                 
+            shm_ann.close()
+            shm_ann.unlink()
         except queue.Empty:
             if not running_event.is_set() and ann_queue.empty(): break
 
