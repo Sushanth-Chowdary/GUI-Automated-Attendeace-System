@@ -19,7 +19,6 @@ from facenet_pytorch import InceptionResnetV1
 from multiprocessing import shared_memory
 import multiprocessing as mp
 import torchvision.ops as ops
-import torchvision.transforms.functional as TF
 from requests.auth import HTTPBasicAuth
 
 # ==========================================
@@ -62,15 +61,10 @@ def format_timestamp(frame_count, fps):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-
 # ==========================================
-# MULTIPROCESSING INFERENCE PROCESS (THROTTLED CPU)
+# MULTIPROCESSING INFERENCE PROCESS (CUDA OPTIMIZED)
 # ==========================================
 def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
-    """
-    Evaluates ML on throttled inbound frames inherently preventing deadlocks.
-    Writes native annotations directly against duplicate outputs maintaining 1-1 strict bounds flawlessly.
-    """
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     use_half = torch.cuda.is_available()
     print(f"[ML PROCESS | {cam_name}] Initializing strictly on {device}...")
@@ -83,6 +77,9 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
             resnet = resnet.half()
         
         faiss_index_path = './face_attendance_faiss.bin'
+        index = None
+        db_tensor = None
+        
         if os.path.exists(faiss_index_path):
             index = faiss.read_index(faiss_index_path)
             try:
@@ -95,23 +92,18 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                 db_tensor = torch.nn.functional.normalize(db_tensor, p=2, dim=1)
                 if use_half:
                     db_tensor = db_tensor.half()
-            except Exception as e:
-                print(f"Failed to reconstruct faiss index: {e}")
+            except Exception:
                 db_tensor = None
-        else:
-            index = None
-            db_tensor = None
             
         meta_path = './face_attendance_meta.pkl'
         if os.path.exists(meta_path):
             with open(meta_path, 'rb') as f:
                 saved_data = pickle.load(f)
-            target_names = saved_data['target_names']
-            y_real = saved_data['y_real']
+            target_names = saved_data.get('target_names', [])
+            y_real = saved_data.get('y_real', [])
         else:
             target_names, y_real = [], []
             
-        to_tensor = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTensor()])
     except Exception as e:
         print(f"[ML PROCESS ERROR | {cam_name}] Failed to load models: {e}")
         return
@@ -122,43 +114,59 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
     archived_tracks = {}
     track_identities = {}
 
-    print(f"[ML PROCESS | {cam_name}] Ready and listening for inbound throttled streams...")
+    print(f"[ML PROCESS | {cam_name}] Ready and listening for inbound streams...")
 
     while True:
         try:
             cmd = cmd_queue.get_nowait()
-            if cmd == 'STOP': break
-        except queue.Empty: pass
+            if cmd == 'STOP':
+                break
+        except queue.Empty:
+            pass
 
         try:
-            item = inf_queue.get(timeout=0.2)
+            item = inf_queue.get(timeout=0.1)
         except queue.Empty:
             continue
             
         meta, input_fps, skipped_frames = item
+        shm_inf = None
         try:
             shm_inf = shared_memory.SharedMemory(name=meta['name'])
+            frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_inf.buf).copy()
         except FileNotFoundError:
-            # Frame expired and was cleaned up by the reader during model warm-up; skip it
             continue
-            
-        try:
-            frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_inf.buf)
-            
-            frame_count += (skipped_frames + 1)
-            fps = input_fps if input_fps > 0 else 30
-            
-            # Deadlock Elimination: Collect tracking metadata strictly decoupled from UI loop drawing frames globally
-            metadata = {'boxes': [], 'ids': [], 'names': []}
-            current_active_faces = 0
+        finally:
+            if shm_inf is not None:
+                try:
+                    shm_inf.close()
+                    shm_inf.unlink()
+                except Exception:
+                    pass
+        
+        frame_count += (skipped_frames + 1)
+        fps = input_fps if input_fps > 0 else 30
+        
+        metadata = {'boxes': [], 'ids': [], 'names': []}
+        current_active_faces = 0
 
+        try:
             if (db_tensor is not None or index is not None) and len(target_names) > 0:
-                results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, half=use_half, imgsz=640)
-                has_detections = results[0].boxes.id is not None
+                results = yolo_model.track(
+                    frame, 
+                    persist=True, 
+                    tracker="bytetrack.yaml", 
+                    verbose=False, 
+                    half=use_half, 
+                    imgsz=640
+                )
+                
+                boxes_obj = results[0].boxes
+                has_detections = boxes_obj is not None and boxes_obj.id is not None
                 
                 if has_detections:
-                    boxes = results[0].boxes.xyxy
-                    ids = results[0].boxes.id.int()
+                    boxes = boxes_obj.xyxy
+                    ids = boxes_obj.id.int()
                     current_active_faces = len(ids)
                     
                     alive_ids = ids.cpu().numpy().tolist()
@@ -166,8 +174,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                         if t_id not in active_track_memory:
                             active_track_memory[t_id] = {
                                 'start_time': format_timestamp(frame_count, fps),
-                                'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
-                                'crop_buffer': []
+                                'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0
                             }
                         active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
 
@@ -180,7 +187,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                         valid_indices = torch.where(valid_mask)[0]
                         if len(valid_indices) > 0:
                             v_boxes = boxes[valid_indices]
-                            v_ids = ids[valid_indices].cpu().numpy().tolist()
+                            v_ids = [alive_ids[idx] for idx in valid_indices.cpu().numpy()]
                             
                             vw = v_boxes[:, 2] - v_boxes[:, 0]
                             vh = v_boxes[:, 3] - v_boxes[:, 1]
@@ -199,51 +206,45 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                             crops = ops.roi_align(frame_tensor, b_batch, output_size=(160, 160))
                             crops_rgb = crops[:, [2, 1, 0], :, :]
                             
-                            batch_tensors, batch_track_ids = [], []
-                            for i, t_id in enumerate(v_ids):
-                                active_track_memory[t_id]['crop_buffer'].append(crops_rgb[i])
-                                if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
-                                    batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
-                                    batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
-                                    active_track_memory[t_id]['crop_buffer'] = []
-                                    
-                            if batch_tensors:
+                            gray = 0.2989 * crops_rgb[:, 0:1, :, :] + 0.5870 * crops_rgb[:, 1:2, :, :] + 0.1140 * crops_rgb[:, 2:3, :, :]
+                            lap_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=gray.dtype)
+                            lap_out = torch.nn.functional.conv2d(gray, lap_kernel, padding=1)
+                            lap_var = torch.var(lap_out, dim=(1, 2, 3))
+                            
+                            sharp_mask = lap_var > 5.0
+                            sharp_indices = torch.where(sharp_mask)[0]
+                            
+                            if len(sharp_indices) > 0:
+                                valid_crops = crops_rgb[sharp_indices]
+                                sharp_ids = [v_ids[i] for i in sharp_indices.cpu().numpy()]
+                                
+                                valid_crops = (valid_crops / 127.5) - 1.0
+                                valid_crops = valid_crops.half() if use_half else valid_crops.float()
+                                
                                 with torch.inference_mode():
-                                    batch_tensor = torch.stack(batch_tensors, dim=0)
-                                    gray = TF.rgb_to_grayscale(batch_tensor)
-                                    lap_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
-                                    lap_out = torch.nn.functional.conv2d(gray, lap_kernel, padding=1)
-                                    lap_var = torch.var(lap_out, dim=(1, 2, 3))
+                                    emb = resnet(valid_crops)
+                                    emb = torch.nn.functional.normalize(emb, p=2, dim=1)
                                     
-                                    mask = lap_var > 5.0
-                                    valid_batch = batch_tensor[mask]
-                                    m_list = mask.cpu().tolist()
-                                    v_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if m_list[k]]
-                                    
-                                    if valid_batch.size(0) > 0:
-                                        valid_batch = (valid_batch / 127.5) - 1.0
-                                        if use_half: 
-                                            valid_batch = valid_batch.half()
-                                        else:
-                                            valid_batch = valid_batch.float()
+                                    if db_tensor is not None:
+                                        db_tensor_cast = db_tensor.to(emb.dtype)
+                                        sims = torch.mm(emb, db_tensor_cast.t())
+                                        max_sims, max_indices = torch.max(sims, dim=1)
+                                        m_sims_vals = max_sims.float().cpu().tolist()
+                                        m_idx_vals = max_indices.cpu().tolist()
+                                    elif index is not None:
+                                        emb_cpu = emb.float().cpu().numpy()
+                                        sims_res, indices_res = index.search(emb_cpu, k=1)
+                                        m_sims_vals = [float(s[0]) for s in sims_res]
+                                        m_idx_vals = [int(idx[0]) for idx in indices_res]
+                                    else:
+                                        m_sims_vals, m_idx_vals = [], []
                                         
-                                        emb = resnet(valid_batch)
-                                        emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-                                        
-                                        if db_tensor is not None:
-                                            db_tensor_cast = db_tensor.to(emb.dtype)
-                                            sims = torch.mm(emb, db_tensor_cast.t())
-                                            max_sims, max_indices = torch.max(sims, dim=1)
-                                            m_sims_vals = max_sims.cpu().tolist()
-                                            m_idx_vals = max_indices.cpu().tolist()
-                                        else:
-                                            emb_cpu = emb.float().cpu().numpy()
-                                            sims_res, indices_res = index.search(emb_cpu, k=1)
-                                            m_sims_vals = [float(s[0]) for s in sims_res]
-                                            m_idx_vals = [int(idx[0]) for idx in indices_res]
-                                        
-                                        for i, t_id in enumerate(v_track_ids):
-                                            name = target_names[y_real[m_idx_vals[i]]] if m_sims_vals[i] > CONFIDENCE_THRESHOLD else "Unknown"
+                                    for i, t_id in enumerate(sharp_ids):
+                                        if i < len(m_sims_vals):
+                                            idx_match = m_idx_vals[i]
+                                            sim_val = m_sims_vals[i]
+                                            name = target_names[y_real[idx_match]] if (sim_val > CONFIDENCE_THRESHOLD and idx_match < len(y_real)) else "Unknown"
+                                            
                                             active_track_memory[t_id]['buffer'].append(name)
                                             active_track_memory[t_id]['all_preds'].append(name)
                                             
@@ -270,24 +271,17 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                             active_track_memory[t_id]['missing_frames'] = 0
 
             try:
-                ann_queue.put((metadata['boxes'], metadata['ids'], metadata['names'], skipped_frames, current_active_faces, fps), timeout=0.2)
+                ann_queue.put((metadata['boxes'], metadata['ids'], metadata['names'], skipped_frames, current_active_faces, fps), timeout=0.1)
             except queue.Full:
                 pass
                 
         except Exception as e:
-            print(f"[ML PROCESS | {cam_name}] Error in execution loop: {e}")
-            
-        finally:
-            try:
-                shm_inf.close()
-                shm_inf.unlink()
-            except (FileNotFoundError, BufferError, Exception):
-                pass
+            print(f"[ML PROCESS | {cam_name}] Runtime Error: {e}")
 
     # ==========================
     # FINAL ATTENDANCE SECURE DUMP
     # ==========================
-    print(f"[ML PROCESS | {cam_name}] Shutting down natively... Generating Log Checkboxes.")
+    print(f"[ML PROCESS | {cam_name}] Shutting down natively... Generating CSV logs.")
     final_mem = {**archived_tracks, **active_track_memory}
     debug_data = []
     student_presence = {name: False for name in target_names}
@@ -295,7 +289,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
 
     for t_id, data in final_mem.items():
         total_frames = data.get('frames_alive', 0)
-        all_preds = data['all_preds']
+        all_preds = data.get('all_preds', [])
         valid_preds = [p for p in all_preds if p != "Unknown"]
         valid_votes_count = len(valid_preds)
         
@@ -311,7 +305,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
             status = "Failed"
             counts = Counter(all_preds)
 
-        if status == "Passed" and winner != "Unknown":
+        if status == "Passed" and winner != "Unknown" and winner in student_presence:
             student_presence[winner] = True
             student_detection_count[winner] += counts.get(winner, 0)
 
@@ -322,38 +316,26 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
             'Gate Status': status, 'Breakdown': dict(Counter(all_preds))
         })
 
-    pd.DataFrame(debug_data).to_csv(os.path.join(RESULTS_DIR, f"{timestamp_str}_{cam_name}_DEBUG_Tracks.csv"))
+    if debug_data:
+        pd.DataFrame(debug_data).to_csv(os.path.join(RESULTS_DIR, f"{timestamp_str}_{cam_name}_DEBUG_Tracks.csv"), index=False)
     output_data = [{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent', 'Detection Count': student_detection_count[s]} for s in target_names]
     pd.DataFrame(output_data).to_csv(os.path.join(RESULTS_DIR, f"{timestamp_str}_{cam_name}_output.csv"), index=False)
 
 
 # ==========================================
-# BACKGROUND OUPUT AND INGESTION THREADS
+# BACKGROUND THREADS (I/O & STREAMING)
 # ==========================================
 def rstp_reader(ip, running_event, raw_queue, inf_queue, ann_frame_queue=None, enable_inference=True):
-    """ 
-    Absolute Watchdog. 
-    Implements CPU optimization via Input Throttling caching explicit dropped frames natively. 
-    """
     url = f"rtsp://{USERNAME}:{PASSWORD}@{ip}:554/stream1"
     cap = None
     last_frame_time = time.perf_counter()
-    shm_history = []
     
     while running_event.is_set():
-        now = time.perf_counter()
-        while shm_history and (now - shm_history[0][0]) > 2.0:
-            _, old_name, old_shm = shm_history.pop(0)
-            try:
-                old_shm.close()
-                old_shm.unlink()
-            except: pass
-            
         if cap is None or not cap.isOpened():
             print(f"[*] Native Reader Booting IP {ip}...")
             cap = cv2.VideoCapture(url)
             if not cap.isOpened():
-                time.sleep(5)
+                time.sleep(3)
                 continue
             last_frame_time = time.perf_counter()
             
@@ -361,53 +343,54 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue, ann_frame_queue=None, e
         now = time.perf_counter()
         
         if not ret:
-            cap.release(); cap = None; continue
+            cap.release()
+            cap = None
+            continue
             
         fps = int(cap.get(cv2.CAP_PROP_FPS))
-        if fps <= 0: fps = 30
+        if fps <= 0:
+            fps = 30
         
         target_interval = 1.0 / fps
         delta = now - last_frame_time
         skipped_frames = max(0, round(delta / target_interval) - 1)
         last_frame_time = now
         
-        # Raw Writer explicitly gets all original non-throttled data
-        if not raw_queue.full():
-            shm1 = shared_memory.SharedMemory(create=True, size=frame.nbytes)
-            shm_arr1 = np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm1.buf)
-            shm_arr1[:] = frame[:]
-            raw_queue.put_nowait(({'name': shm1.name, 'shape': frame.shape, 'dtype': str(frame.dtype)}, fps, skipped_frames + 1))
-            shm_history.append((now, shm1.name, shm1))
+        # In-process raw recording (Thread-safe memory reference)
+        if raw_queue is not None and not raw_queue.full():
+            raw_queue.put_nowait((frame, fps, skipped_frames + 1))
             
-        # Throttled Dispatch evaluating constraints preventing CPU Serialization overload arrays entirely
-        if enable_inference:
-            if not inf_queue.full() and (ann_frame_queue is None or not ann_frame_queue.full()):
-                shm2 = shared_memory.SharedMemory(create=True, size=frame.nbytes)
-                shm_arr2 = np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm2.buf)
-                shm_arr2[:] = frame[:]
-                inf_queue.put_nowait(({'name': shm2.name, 'shape': frame.shape, 'dtype': str(frame.dtype)}, fps, skipped_frames))
-                shm_history.append((now, shm2.name, shm2))
-                if ann_frame_queue is not None:
-                    shm3 = shared_memory.SharedMemory(create=True, size=frame.nbytes)
-                    shm_arr3 = np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm3.buf)
-                    shm_arr3[:] = frame[:]
-                    ann_frame_queue.put_nowait(({'name': shm3.name, 'shape': frame.shape, 'dtype': str(frame.dtype)}, fps, skipped_frames))
-                    shm_history.append((now, shm3.name, shm3))
+        # Real-time UI and Annotation Feed (Main process queue)
+        if ann_frame_queue is not None:
+            if ann_frame_queue.full():
+                try:
+                    ann_frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            ann_frame_queue.put_nowait((frame, fps, skipped_frames))
+
+        # Inter-Process Shared Memory for ML Background Process
+        if enable_inference and inf_queue is not None and not inf_queue.full():
+            try:
+                shm = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+                shm_arr = np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm.buf)
+                shm_arr[:] = frame[:]
+                inf_queue.put_nowait(({'name': shm.name, 'shape': frame.shape, 'dtype': str(frame.dtype)}, fps, skipped_frames))
+                shm.close()
+            except Exception:
+                pass
                 
-    if cap: cap.release()
+    if cap:
+        cap.release()
 
 def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_ui=False):
     writer = None
     while True:
         try:
             item = queue_obj.get(timeout=0.2)
-            if item is None: break
-            meta, input_fps, duplicates = item
-            try:
-                shm_raw = shared_memory.SharedMemory(name=meta['name'])
-            except FileNotFoundError:
-                continue
-            frame = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_raw.buf)
+            if item is None:
+                break
+            frame, input_fps, duplicates = item
             
             if writer is None:
                 h, w = frame.shape[:2]
@@ -417,26 +400,23 @@ def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_
             for _ in range(duplicates):
                 writer.write(frame)
                 
-            if populate_ui and ui_queue is not None:
-                if not ui_queue.full():
-                    ui_frame = cv2.resize(frame, (1024, 576))
-                    ui_queue.put_nowait((ui_frame, 0))
-                    
-            try:
-                shm_raw.close()
-                shm_raw.unlink()
-            except (FileNotFoundError, BufferError, Exception):
-                pass
+            if populate_ui and ui_queue is not None and not ui_queue.full():
+                ui_frame = cv2.resize(frame, (1024, 576))
+                ui_queue.put_nowait((ui_frame, 0))
+                
         except queue.Empty:
-            if not running_event.is_set() and queue_obj.empty(): break
-    if writer: writer.release()
+            if not running_event.is_set() and queue_obj.empty():
+                break
+    if writer:
+        writer.release()
 
 def async_video_writer_worker(writer_queue, output_path, running_event):
     writer = None
     while True:
         try:
             item = writer_queue.get(timeout=0.2)
-            if item is None: break
+            if item is None:
+                break
             frame, input_fps, duplicates = item
             
             if writer is None:
@@ -448,36 +428,25 @@ def async_video_writer_worker(writer_queue, output_path, running_event):
                 writer.write(frame)
                 
         except queue.Empty:
-            if not running_event.is_set() and writer_queue.empty(): break
-            
-    if writer: writer.release()
+            if not running_event.is_set() and writer_queue.empty():
+                break
+    if writer:
+        writer.release()
 
 def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, running_event):
-    """
-    Highly robust generic bounds mapping directly towards duplicating skipped loops.
-    Strictly deadlock-free! 
-    """
     while True:
         try:
             item = ann_queue.get(timeout=0.2)
-            if item is None: break
+            if item is None:
+                break
             boxes, ids, names, skipped_frames, active_faces, input_fps = item
                 
-            frame_copy = None
+            frame = None
             try:
                 frame_item = ann_frame_queue.get(timeout=0.2)
-                meta, _, _ = frame_item
-                try:
-                    shm_ann = shared_memory.SharedMemory(name=meta['name'])
-                    frame_buffer = np.ndarray(meta['shape'], dtype=meta['dtype'], buffer=shm_ann.buf)
-                    frame_copy = frame_buffer.copy()
-                    shm_ann.close()
-                except FileNotFoundError:
-                    pass
+                raw_frame, _, _ = frame_item
+                frame = raw_frame.copy()
             except queue.Empty:
-                pass
-
-            if frame_copy is None:
                 continue
 
             for i in range(len(ids)):
@@ -485,18 +454,19 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
                 t_id = ids[i]
                 name = names[i]
                 color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
-                cv2.rectangle(frame_copy, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-                cv2.putText(frame_copy, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
-            if not writer_queue.full():
-                writer_queue.put_nowait((frame_copy, input_fps, skipped_frames + 1))
+            if writer_queue is not None and not writer_queue.full():
+                writer_queue.put_nowait((frame, input_fps, skipped_frames + 1))
                 
-            if not ui_queue.full():
-                ui_frame = cv2.resize(frame_copy, (1024, 576))
+            if ui_queue is not None and not ui_queue.full():
+                ui_frame = cv2.resize(frame, (1024, 576))
                 ui_queue.put_nowait((ui_frame, active_faces))
                 
         except queue.Empty:
-            if not running_event.is_set() and ann_queue.empty(): break
+            if not running_event.is_set() and ann_queue.empty():
+                break
 
 
 # ==========================================
@@ -520,6 +490,7 @@ class AttendanceApp(ctk.CTk):
         self.frames_rendered = 0
         self.cam1_active_faces = 0
         self.cam2_active_faces = 0
+        self.gui_loop_active = False
 
         self.setup_ui()
 
@@ -633,7 +604,8 @@ class AttendanceApp(ctk.CTk):
         self.video_frame.pack(side="right", fill="both", expand=True, padx=20, pady=20)
 
     def start_tracking(self):
-        if self.running_event.is_set(): return
+        if self.running_event.is_set():
+            return
             
         self.running_event.set()
         self.start_btn.configure(state="disabled")
@@ -661,7 +633,10 @@ class AttendanceApp(ctk.CTk):
         
         total_time_cam1 = len(selected_cam1_presets) * (p_info['cam1'] + 5) if use_cam1 else 0
         total_time_cam2 = len(selected_cam2_presets) * (p_info['cam2'] + 5) if use_cam2 else 0
-        self.t_end = time.perf_counter() + max(total_time_cam1, total_time_cam2)
+        duration = max(total_time_cam1, total_time_cam2)
+        if duration <= 0:
+            duration = 300
+        self.t_end = time.perf_counter() + duration
 
         timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.threads = []
@@ -671,10 +646,10 @@ class AttendanceApp(ctk.CTk):
             self.cam1_ui_q = queue.Queue(maxsize=30)
             
             if mode1:
-                self.cam1_inf_q = mp.Queue(maxsize=30)
+                self.cam1_inf_q = mp.Queue(maxsize=15)
                 self.cam1_ann_q = mp.Queue(maxsize=150)
                 self.cam1_cmd_q = mp.Queue()
-                self.cam1_ann_frame_q = queue.Queue(maxsize=30)
+                self.cam1_ann_frame_q = queue.Queue(maxsize=10)
                 self.cam1_writer_q = queue.Queue(maxsize=150)
             else:
                 self.cam1_inf_q = None
@@ -683,27 +658,28 @@ class AttendanceApp(ctk.CTk):
                 self.cam1_ann_frame_q = None
                 self.cam1_writer_q = None
                 
-            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.cam1_ann_frame_q, mode1)))
-            self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, selected_cam1_presets, p_info['cam1'])))
+            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.cam1_ann_frame_q, mode1), daemon=True))
+            self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, selected_cam1_presets, p_info['cam1']), daemon=True))
             
             if mode1:
                 self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
-                self.ml_p1.daemon = True; self.ml_p1.start()
-                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, False)))
-                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ann_frame_q, self.cam1_ui_q, self.cam1_writer_q, self.running_event)))
-                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam1_writer_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)))
+                self.ml_p1.daemon = True
+                self.ml_p1.start()
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, False), daemon=True))
+                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ann_frame_q, self.cam1_ui_q, self.cam1_writer_q, self.running_event), daemon=True))
+                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam1_writer_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event), daemon=True))
             else:
-                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, True)))
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, True), daemon=True))
 
         if use_cam2:
             self.cam2_raw_q = queue.Queue(maxsize=60)
             self.cam2_ui_q = queue.Queue(maxsize=30)
             
             if mode2:
-                self.cam2_inf_q = mp.Queue(maxsize=30)
+                self.cam2_inf_q = mp.Queue(maxsize=15)
                 self.cam2_ann_q = mp.Queue(maxsize=150)
                 self.cam2_cmd_q = mp.Queue()
-                self.cam2_ann_frame_q = queue.Queue(maxsize=30)
+                self.cam2_ann_frame_q = queue.Queue(maxsize=10)
                 self.cam2_writer_q = queue.Queue(maxsize=150)
             else:
                 self.cam2_inf_q = None
@@ -712,26 +688,32 @@ class AttendanceApp(ctk.CTk):
                 self.cam2_ann_frame_q = None
                 self.cam2_writer_q = None
                 
-            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.cam2_ann_frame_q, mode2)))
-            self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, selected_cam2_presets, p_info['cam2'])))
+            self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.cam2_ann_frame_q, mode2), daemon=True))
+            self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, selected_cam2_presets, p_info['cam2']), daemon=True))
             
             if mode2:
                 self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
-                self.ml_p2.daemon = True; self.ml_p2.start()
-                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, False)))
-                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ann_frame_q, self.cam2_ui_q, self.cam2_writer_q, self.running_event)))
-                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam2_writer_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)))
+                self.ml_p2.daemon = True
+                self.ml_p2.start()
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, False), daemon=True))
+                self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ann_frame_q, self.cam2_ui_q, self.cam2_writer_q, self.running_event), daemon=True))
+                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam2_writer_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event), daemon=True))
             else:
-                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, True)))
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, True), daemon=True))
 
-        for t in self.threads: t.start()
+        for t in self.threads:
+            t.start()
 
         self.last_fps_time = time.perf_counter()
         self.frames_rendered = 0
-        self.update_gui_frame()
+        
+        if not self.gui_loop_active:
+            self.gui_loop_active = True
+            self.update_gui_frame()
 
     def stop_tracking(self):
-        if not self.running_event.is_set(): return
+        if not self.running_event.is_set():
+            return
         self.running_event.clear()
         
         if hasattr(self, 'cam1_cmd_q') and self.cam1_cmd_q:
@@ -758,10 +740,13 @@ class AttendanceApp(ctk.CTk):
 
     def ptz_runner(self, ip, presets, duration):
         for preset in presets:
-            if not self.running_event.is_set(): break
+            if not self.running_event.is_set():
+                break
             url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&{preset}"
-            try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=5)
-            except: pass
+            try:
+                requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=5)
+            except Exception:
+                pass
             
             t_mechanical = time.perf_counter()
             while self.running_event.is_set() and (time.perf_counter() - t_mechanical) < 5.0:
@@ -778,13 +763,16 @@ class AttendanceApp(ctk.CTk):
         def send_cmd():
             if command == 'ptzstop':
                 time.sleep(0.1)
-            try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
-            except: pass
-        threading.Thread(target=send_cmd).start()
+            try:
+                requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
+            except Exception:
+                pass
+        threading.Thread(target=send_cmd, daemon=True).start()
 
     def update_gui_frame(self):
         if not self.running_event.is_set():
             self.video_frame.configure(image=None, text="Camera ML Feed Offline")
+            self.gui_loop_active = False
             return
             
         try:
@@ -797,21 +785,23 @@ class AttendanceApp(ctk.CTk):
                 
             h, rem = divmod(remaining, 3600)
             m, s = divmod(rem, 60)
-            self.time_lbl.configure(text=f"Time Remaining: {h:02d}:{m:02d}:{s:02d}")
+            self.time_lbl.configure(text=f"Remaining Timer: {h:02d}:{m:02d}:{s:02d}")
             
             frame1 = None
             if hasattr(self, 'cam1_ui_q') and self.cam1_ui_q and not self.cam1_ui_q.empty():
-                try: 
+                try:
                     res1 = self.cam1_ui_q.get_nowait()
                     frame1, self.cam1_active_faces = res1
-                except queue.Empty: pass
+                except queue.Empty:
+                    pass
                     
             frame2 = None
             if hasattr(self, 'cam2_ui_q') and self.cam2_ui_q and not self.cam2_ui_q.empty():
-                try: 
+                try:
                     res2 = self.cam2_ui_q.get_nowait()
                     frame2, self.cam2_active_faces = res2
-                except queue.Empty: pass
+                except queue.Empty:
+                    pass
             
             if (now - self.last_fps_time) >= 1.0:
                 self.sys_fps = self.frames_rendered / (now - self.last_fps_time)
@@ -830,8 +820,13 @@ class AttendanceApp(ctk.CTk):
                 self.video_frame.configure(image=imgtk, text="")
                 self.video_frame.image = imgtk
                 
-        except Exception as e: pass
-        finally: self.after(10, self.update_gui_frame)
+        except Exception:
+            pass
+        finally:
+            if self.running_event.is_set():
+                self.after(15, self.update_gui_frame)
+            else:
+                self.gui_loop_active = False
 
 if __name__ == "__main__":
     mp.freeze_support()
