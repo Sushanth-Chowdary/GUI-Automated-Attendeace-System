@@ -505,14 +505,14 @@ class AttendanceApp(ctk.CTk):
         btn_fi = ctk.CTkButton(self.manual_ptz_frame, text="Focus In", width=50)
         btn_fo = ctk.CTkButton(self.manual_ptz_frame, text="Focus Out", width=50)
 
-        for btn, cmd in [
-            (btn_up, "up"), (btn_down, "down"), (btn_left, "left"), 
-            (btn_right, "right"), (btn_zi, "zoomin"), (btn_zo, "zoomout"), 
-            (btn_fi, "focusin"), (btn_fo, "focusout")
+        for btn, cmd, stop_cmd in [
+            (btn_up, "up", "ptzstop"), (btn_down, "down", "ptzstop"), (btn_left, "left", "ptzstop"), 
+            (btn_right, "right", "ptzstop"), (btn_zi, "zoomin", "zoomstop"), (btn_zo, "zoomout", "zoomstop"), 
+            (btn_fi, "focusin", "focusstop"), (btn_fo, "focusout", "focusstop")
         ]:
             for widget in [btn, btn._canvas, btn._text_label]:
                 widget.bind("<ButtonPress-1>", lambda e, c=cmd: self.manual_ptz(c))
-                widget.bind("<ButtonRelease-1>", lambda e: self.manual_ptz("ptzstop"))
+                widget.bind("<ButtonRelease-1>", lambda e, sc=stop_cmd: self.manual_ptz(sc))
 
         btn_up.grid(row=0, column=1, padx=2, pady=2)
         btn_down.grid(row=2, column=1, padx=2, pady=2)
@@ -687,7 +687,7 @@ class AttendanceApp(ctk.CTk):
         ip = CAMERA_IP_1 if target == "Camera 1" else CAMERA_IP_2
         url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&{command}"
         def send_cmd():
-            if command == 'ptzstop':
+            if command in ('ptzstop', 'zoomstop', 'focusstop'):
                 time.sleep(0.1)
             try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
             except: pass
@@ -746,5 +746,6 @@ class AttendanceApp(ctk.CTk):
 
 if __name__ == "__main__":
     mp.freeze_support()
+    mp.set_start_method('spawn', force=True)
     app = AttendanceApp()
     app.mainloop()
