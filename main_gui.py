@@ -81,9 +81,24 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
             resnet = resnet.half()
         
         faiss_index_path = './face_attendance_faiss.bin'
+        ref_embeddings_tensor = None
         if os.path.exists(faiss_index_path):
             index = faiss.read_index(faiss_index_path)
             index.nprobe = 20
+            try:
+                try:
+                    ref_embeddings = index.reconstruct_n(0, index.ntotal)
+                except AttributeError:
+                    index.make_direct_map()
+                    ref_embeddings = np.array([index.reconstruct(i) for i in range(index.ntotal)])
+                
+                ref_embeddings_tensor = torch.from_numpy(ref_embeddings).to(device).float()
+                ref_embeddings_tensor = torch.nn.functional.normalize(ref_embeddings_tensor, p=2, dim=1)
+                if use_half:
+                    ref_embeddings_tensor = ref_embeddings_tensor.half()
+            except Exception as e:
+                print(f"[ML PROCESS | {cam_name}] Failed to extract FAISS vectors to GPU: {e}")
+                index = None
         else:
             index = None
             
@@ -138,7 +153,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
             metadata = {'boxes': [], 'ids': [], 'names': []}
             current_active_faces = 0
 
-            if index is not None and len(target_names) > 0:
+            if ref_embeddings_tensor is not None and len(target_names) > 0:
                 results = yolo_model.track(frame_array, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=16 if use_half else None, imgsz=640)
                 has_detections = results[0].boxes.id is not None
                 
@@ -203,7 +218,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                                 batch_tensor = batch_tensor[:, [2, 1, 0], :, :] # Swap BGR to RGB natively
                                 
                                 # GPU Vectorized Blur Filtering
-                                gray = 0.2989 * batch_tensor[:, 0:1, :, :] + 0.5870 * batch_tensor[:, 1:2, :, :] + 0.1140 * batch_tensor[:, 2:3, :, :]
+                                gray = transforms.functional.rgb_to_grayscale(batch_tensor)
                                 laplacian_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
                                 laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
                                 laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
@@ -217,12 +232,18 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                                     valid_batch_tensor = (valid_batch_tensor / 127.5) - 1.0
                                     if use_half:
                                         valid_batch_tensor = valid_batch_tensor.half()
-                                    embeddings = resnet(valid_batch_tensor).cpu().numpy().astype('float32')
-                                    faiss.normalize_L2(embeddings)
-                                    sims, indices = index.search(embeddings, k=1)
+                                    
+                                    embeddings = resnet(valid_batch_tensor)
+                                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+                                    
+                                    sim_matrix = torch.mm(embeddings, ref_embeddings_tensor.t())
+                                    max_sims, max_indices = torch.max(sim_matrix, dim=1)
+                                    
+                                    sims_list = max_sims.cpu().tolist()
+                                    indices_list = max_indices.cpu().tolist()
                                     
                                     for i, t_id in enumerate(valid_batch_track_ids):
-                                        name = target_names[y_real[indices[i][0]]] if sims[i][0] > CONFIDENCE_THRESHOLD else "Unknown"
+                                        name = target_names[y_real[indices_list[i]]] if sims_list[i] > CONFIDENCE_THRESHOLD else "Unknown"
                                         active_track_memory[t_id]['buffer'].append(name)
                                         active_track_memory[t_id]['all_preds'].append(name)
                                         
