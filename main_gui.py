@@ -516,7 +516,28 @@ class AttendanceApp(ctk.CTk):
         self.cam2_active_faces = 0
 
         self.setup_ui()
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        self.ptz_cmd_queue = queue.Queue()
+        self.ptz_worker_thread = threading.Thread(target=self.ptz_command_worker, daemon=True)
+        self.ptz_worker_thread.start()
 
+    def ptz_command_worker(self):
+        while True:
+            url = self.ptz_cmd_queue.get()
+            if url == "QUIT": break
+            try:
+                requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
+            except Exception:
+                pass
+        
+    def on_closing(self):
+        print("Application shutting down... cleaning up memory and processes.")
+        self.stop_tracking()
+        if hasattr(self, 'ptz_cmd_queue'):
+            self.ptz_cmd_queue.put("QUIT")
+        self.destroy()
+        
     def setup_ui(self):
         self.sidebar_frame = ctk.CTkScrollableFrame(self, width=350, corner_radius=0)
         self.sidebar_frame.pack(side="left", fill="y", padx=0, pady=0)
@@ -733,7 +754,19 @@ class AttendanceApp(ctk.CTk):
         if hasattr(self, 'cam2_cmd_q') and self.cam2_cmd_q:
             self.cam2_cmd_q.put('STOP')
 
-        # Safely detach and purge pending SharedMemory scopes actively lodged in queues!
+        # 1. CRITICAL FIX: Wait for background reader threads to stop generating frames
+        if hasattr(self, 'threads'):
+            for t in self.threads:
+                if t.is_alive():
+                    t.join(timeout=1.0)
+                    
+        # 2. Wait for ML processes to safely exit
+        if hasattr(self, 'ml_p1') and self.ml_p1.is_alive():
+            self.ml_p1.join(timeout=2.0)
+        if hasattr(self, 'ml_p2') and self.ml_p2.is_alive():
+            self.ml_p2.join(timeout=2.0)
+
+        # 3. Now safely detach and purge pending SharedMemory scopes
         for q_name in ['cam1_inf_q', 'cam2_inf_q', 'cam1_raw_q', 'cam2_raw_q', 'cam1_ann_frame_q', 'cam2_ann_frame_q']:
             if hasattr(self, q_name) and getattr(self, q_name):
                 q = getattr(self, q_name)
@@ -748,20 +781,12 @@ class AttendanceApp(ctk.CTk):
                             except Exception: pass
                     except queue.Empty: break
 
-        if hasattr(self, 'cam1_ann_q') and self.cam1_ann_q:
-            self.cam1_ann_q.put(None)
-        if hasattr(self, 'cam2_ann_q') and self.cam2_ann_q:
-            self.cam2_ann_q.put(None)
-            
-        if hasattr(self, 'cam1_writer_q') and self.cam1_writer_q:
-            self.cam1_writer_q.put(None)
-        if hasattr(self, 'cam2_writer_q') and self.cam2_writer_q:
-            self.cam2_writer_q.put(None)
-            
-        if hasattr(self, 'cam1_raw_q') and self.cam1_raw_q:
-            self.cam1_raw_q.put(None)
-        if hasattr(self, 'cam2_raw_q') and self.cam2_raw_q:
-            self.cam2_raw_q.put(None)
+        if hasattr(self, 'cam1_ann_q') and self.cam1_ann_q: self.cam1_ann_q.put(None)
+        if hasattr(self, 'cam2_ann_q') and self.cam2_ann_q: self.cam2_ann_q.put(None)
+        if hasattr(self, 'cam1_writer_q') and self.cam1_writer_q: self.cam1_writer_q.put(None)
+        if hasattr(self, 'cam2_writer_q') and self.cam2_writer_q: self.cam2_writer_q.put(None)
+        if hasattr(self, 'cam1_raw_q') and self.cam1_raw_q: self.cam1_raw_q.put(None)
+        if hasattr(self, 'cam2_raw_q') and self.cam2_raw_q: self.cam2_raw_q.put(None)
         
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
@@ -785,12 +810,7 @@ class AttendanceApp(ctk.CTk):
         target = self.view_target.get()
         ip = CAMERA_IP_1 if target == "Camera 1" else CAMERA_IP_2
         url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&{command}"
-        def send_cmd():
-            if command in ('ptzstop', 'zoomstop', 'focusstop'):
-                time.sleep(0.1)
-            try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
-            except: pass
-        threading.Thread(target=send_cmd).start()
+        self.ptz_cmd_queue.put(url)
 
     def update_gui_frame(self):
         if not self.running_event.is_set():
