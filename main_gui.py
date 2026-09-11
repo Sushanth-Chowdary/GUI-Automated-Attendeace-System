@@ -14,10 +14,12 @@ import pickle
 import torch
 import numpy as np
 import torchvision.transforms as transforms
+import torchvision.ops as ops
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
 from requests.auth import HTTPBasicAuth
 import multiprocessing as mp
+import multiprocessing.shared_memory as shared_memory
 
 # ==========================================
 # CONFIGURATION
@@ -57,17 +59,6 @@ def format_timestamp(frame_count, fps):
     h, rem = divmod(total_seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
-
-def crop_standard(img, box):
-    x1, y1, x2, y2 = map(int, box)
-    w, h = x2 - x1, y2 - y1
-    margin_x, margin_y = int(w * 0.15), int(h * 0.15)
-    x1 = max(0, x1 - margin_x)
-    y1 = max(0, y1 - margin_y)
-    x2 = min(img.shape[1], x2 + margin_x)
-    y2 = min(img.shape[0], y2 + margin_y)
-    return img[y1:y2, x1:x2]
-
 
 
 # ==========================================
@@ -129,101 +120,132 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         except queue.Empty:
             continue
             
-        frame, input_fps, skipped_frames = item
-        
-        frame_count += (skipped_frames + 1)
-        fps = input_fps if input_fps > 0 else 30
-        
-        # Deadlock Elimination: Collect tracking metadata strictly decoupled from UI loop drawing frames globally
-        metadata = {'boxes': [], 'ids': [], 'names': []}
-        current_active_faces = 0
-
-        if index is not None and len(target_names) > 0:
-            results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=16 if use_half else None, imgsz=640)
-            has_detections = results[0].boxes.id is not None
+        shm = None
+        try:
+            shm = shared_memory.SharedMemory(name=item['shm_name'])
+            frame_array = np.ndarray(item['shape'], dtype=item['dtype'], buffer=shm.buf)
             
-            if has_detections:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                ids = results[0].boxes.id.int().cpu().numpy()
-                current_active_faces = len(ids)
+            # Pure GPU Optimization: Immediately move frame tensor native to GPU bounds.
+            frame_tensor = torch.from_numpy(frame_array).to(device, non_blocking=True).float()
+            
+            input_fps = item['fps']
+            skipped_frames = item['skipped_frames']
+            
+            frame_count += (skipped_frames + 1)
+            fps = input_fps if input_fps > 0 else 30
+            
+            # Deadlock Elimination: Collect tracking metadata strictly decoupled from UI loop drawing frames globally
+            metadata = {'boxes': [], 'ids': [], 'names': []}
+            current_active_faces = 0
+
+            if index is not None and len(target_names) > 0:
+                results = yolo_model.track(frame_array, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=16 if use_half else None, imgsz=640)
+                has_detections = results[0].boxes.id is not None
                 
-                for t_id in ids:
-                    if t_id not in active_track_memory:
-                        active_track_memory[t_id] = {
-                            'start_time': format_timestamp(frame_count, fps),
-                            'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
-                            'crop_buffer': []
-                        }
-                    active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
-
-                if frame_count % FRAME_SKIP == 0 or (frame_count - skipped_frames) % FRAME_SKIP == 0:
-                    batch_tensors, batch_track_ids = [], []
-                    for i, t_id in enumerate(ids):
-                        x1, y1, x2, y2 = boxes[i]
-                        box_w, box_h = x2 - x1, y2 - y1
-                        if box_w < 65 or box_h < 65:
-                            continue
-                        aspect_ratio = box_w / box_h if box_h != 0 else 0
-                        if aspect_ratio < 0.55 or aspect_ratio > 1.55:
-                            continue
-
-                        crop = crop_standard(frame, boxes[i])
-                        if crop.size > 0:
-                            resized = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
-                            
-                            active_track_memory[t_id]['crop_buffer'].append(resized)
-                            
-                            if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
-                                batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
-                                batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
-                                active_track_memory[t_id]['crop_buffer'] = []
+                if has_detections:
+                    # Explicitly move the tensors to the GPU to match batch_idx
+                    boxes = results[0].boxes.xyxy.to(device) 
+                    ids = results[0].boxes.id.to(device).int() 
+                    current_active_faces = len(ids)
                     
-                    if batch_tensors:
-                        with torch.inference_mode():
-                            batch_array = np.stack(batch_tensors, axis=0)
-                            batch_tensor = torch.from_numpy(batch_array).to(device, non_blocking=True).float()
-                            batch_tensor = batch_tensor.permute(0, 3, 1, 2)[:, [2, 1, 0], :, :]
+                    ids_list = ids.cpu().tolist()
+                    for t_id in ids_list:
+                        if t_id not in active_track_memory:
+                            active_track_memory[t_id] = {
+                                'start_time': format_timestamp(frame_count, fps),
+                                'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
+                                'crop_buffer': []
+                            }
+                        active_track_memory[t_id]['frames_alive'] += (skipped_frames + 1)
+
+                    if frame_count % FRAME_SKIP == 0 or (frame_count - skipped_frames) % FRAME_SKIP == 0:
+                        batch_tensors, batch_track_ids = [], []
+                        
+                        box_w = boxes[:, 2] - boxes[:, 0]
+                        box_h = boxes[:, 3] - boxes[:, 1]
+                        aspect_ratios = box_w / (box_h + 1e-6)
+                        
+                        valid_mask = (box_w >= 65) & (box_h >= 65) & (aspect_ratios >= 0.55) & (aspect_ratios <= 1.55)
+                        
+                        if valid_mask.any():
+                            valid_boxes = boxes[valid_mask].clone()
+                            valid_ids = ids[valid_mask]
                             
-                            # GPU Vectorized Blur Filtering
-                            gray = 0.2989 * batch_tensor[:, 0:1, :, :] + 0.5870 * batch_tensor[:, 1:2, :, :] + 0.1140 * batch_tensor[:, 2:3, :, :]
-                            laplacian_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
-                            laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
-                            laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
+                            margin_x = (valid_boxes[:, 2] - valid_boxes[:, 0]) * 0.15
+                            margin_y = (valid_boxes[:, 3] - valid_boxes[:, 1]) * 0.15
                             
-                            mask = laplacian_var > 5.0
-                            mask_list = mask.cpu().tolist()
-                            valid_batch_tensor = batch_tensor[mask]
-                            valid_batch_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if mask_list[k]]
+                            valid_boxes[:, 0] = torch.clamp(valid_boxes[:, 0] - margin_x, min=0)
+                            valid_boxes[:, 1] = torch.clamp(valid_boxes[:, 1] - margin_y, min=0)
+                            valid_boxes[:, 2] = torch.clamp(valid_boxes[:, 2] + margin_x, max=float(frame_array.shape[1]))
+                            valid_boxes[:, 3] = torch.clamp(valid_boxes[:, 3] + margin_y, max=float(frame_array.shape[0]))
                             
-                            if valid_batch_tensor.size(0) > 0:
-                                valid_batch_tensor = (valid_batch_tensor / 127.5) - 1.0
-                                if use_half:
-                                    valid_batch_tensor = valid_batch_tensor.half()
-                                embeddings = resnet(valid_batch_tensor).cpu().numpy().astype('float32')
-                                faiss.normalize_L2(embeddings)
-                                sims, indices = index.search(embeddings, k=1)
+                            batch_idx = torch.zeros((valid_boxes.size(0), 1), device=device, dtype=valid_boxes.dtype)
+                            roi_boxes = torch.cat((batch_idx, valid_boxes), dim=1)
+                            
+                            # Standardize to NCHW format
+                            frame_tensor_chw = frame_tensor.permute(2, 0, 1).unsqueeze(0)
+                            
+                            # Native GPU Vectorized Extraction and Resize
+                            crops = ops.roi_align(frame_tensor_chw, roi_boxes, output_size=(160, 160)).detach()
+                            
+                            valid_ids_list = valid_ids.cpu().tolist()
+                            for i, t_id in enumerate(valid_ids_list):
+                                active_track_memory[t_id]['crop_buffer'].append(crops[i:i+1])
                                 
-                                for i, t_id in enumerate(valid_batch_track_ids):
-                                    name = target_names[y_real[indices[i][0]]] if sims[i][0] > CONFIDENCE_THRESHOLD else "Unknown"
-                                    active_track_memory[t_id]['buffer'].append(name)
-                                    active_track_memory[t_id]['all_preds'].append(name)
+                                if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
+                                    batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
+                                    batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
+                                    active_track_memory[t_id]['crop_buffer'] = []
+                        
+                        if batch_tensors:
+                            with torch.inference_mode():
+                                batch_tensor = torch.cat(batch_tensors, dim=0) # (N, 3, 160, 160)
+                                batch_tensor = batch_tensor[:, [2, 1, 0], :, :] # Swap BGR to RGB natively
+                                
+                                # GPU Vectorized Blur Filtering
+                                gray = 0.2989 * batch_tensor[:, 0:1, :, :] + 0.5870 * batch_tensor[:, 1:2, :, :] + 0.1140 * batch_tensor[:, 2:3, :, :]
+                                laplacian_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
+                                laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
+                                laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
+                                
+                                mask = laplacian_var > 5.0
+                                mask_list = mask.cpu().tolist()
+                                valid_batch_tensor = batch_tensor[mask]
+                                valid_batch_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if mask_list[k]]
+                                
+                                if valid_batch_tensor.size(0) > 0:
+                                    valid_batch_tensor = (valid_batch_tensor / 127.5) - 1.0
+                                    if use_half:
+                                        valid_batch_tensor = valid_batch_tensor.half()
+                                    embeddings = resnet(valid_batch_tensor).cpu().numpy().astype('float32')
+                                    faiss.normalize_L2(embeddings)
+                                    sims, indices = index.search(embeddings, k=1)
                                     
-                                    if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                                        valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
-                                        winner = Counter(valid_history).most_common(1)[0][0] if valid_history else "Unknown"
-                                        track_identities[t_id] = winner
-                                        active_track_memory[t_id]['buffer'] = []
+                                    for i, t_id in enumerate(valid_batch_track_ids):
+                                        name = target_names[y_real[indices[i][0]]] if sims[i][0] > CONFIDENCE_THRESHOLD else "Unknown"
+                                        active_track_memory[t_id]['buffer'].append(name)
+                                        active_track_memory[t_id]['all_preds'].append(name)
+                                        
+                                        if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
+                                            valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
+                                            winner = Counter(valid_history).most_common(1)[0][0] if valid_history else "Unknown"
+                                            track_identities[t_id] = winner
+                                            active_track_memory[t_id]['buffer'] = []
 
-                # Collect tracking metadata instead of drawing on frames directly
-                for i in range(len(ids)):
-                    t_id = ids[i]
-                    box = boxes[i]
-                    name = track_identities.get(t_id, "Analyzing...")
-                    metadata['boxes'].append(box)
-                    metadata['ids'].append(t_id)
-                    metadata['names'].append(name)
+                    # Collect tracking metadata instead of drawing on frames directly
+                    boxes_cpu = boxes.cpu().numpy()
+                    for i in range(len(ids_list)):
+                        t_id = ids_list[i]
+                        box = boxes_cpu[i]
+                        name = track_identities.get(t_id, "Analyzing...")
+                        metadata['boxes'].append(box)
+                        metadata['ids'].append(t_id)
+                        metadata['names'].append(name)
 
-                alive_ids = set(ids)
+                    alive_ids = set(ids_list)
+                else:
+                    alive_ids = set()
+
                 for t_id in list(active_track_memory.keys()):
                     if t_id not in alive_ids:
                         active_track_memory[t_id]['missing_frames'] += (skipped_frames + 1)
@@ -231,6 +253,11 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                             archived_tracks[t_id] = active_track_memory.pop(t_id)
                     else:
                         active_track_memory[t_id]['missing_frames'] = 0
+
+        finally:
+            if shm is not None:
+                shm.close()
+                shm.unlink()
 
         # Enforce highly reliable logic outputs directly to single bound queue strictly avoiding cross queue ID locks!
         try:
@@ -316,16 +343,30 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue, ann_frame_queue=None, e
         skipped_frames = max(0, round(delta / target_interval) - 1)
         last_frame_time = now
         
-        # Raw Writer explicitly gets all original non-throttled data
+        # Raw Writer explicitly gets all original non-throttled data payload dictionaries (Zero-Copy)
         if not raw_queue.full():
-            raw_queue.put_nowait((frame, fps, skipped_frames + 1))
+            try:
+                shm_raw = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+                np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm_raw.buf)[:] = frame[:]
+                raw_queue.put_nowait({'shm_name': shm_raw.name, 'shape': frame.shape, 'dtype': frame.dtype, 'fps': fps, 'skipped_frames': skipped_frames + 1})
+                shm_raw.close()
+            except Exception: pass
             
-        # Throttled Dispatch evaluating constraints preventing CPU Serialization overload arrays entirely
+        # Throttled Dispatch payload dicts evaluating constraints preventing CPU Serialization overload arrays entirely
         if enable_inference:
             if not inf_queue.full() and (ann_frame_queue is None or not ann_frame_queue.full()):
-                inf_queue.put_nowait((frame, fps, skipped_frames))
-                if ann_frame_queue is not None:
-                    ann_frame_queue.put_nowait((frame, fps, skipped_frames))
+                try:
+                    shm_inf = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+                    np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm_inf.buf)[:] = frame[:]
+                    inf_queue.put_nowait({'shm_name': shm_inf.name, 'shape': frame.shape, 'dtype': frame.dtype, 'fps': fps, 'skipped_frames': skipped_frames})
+                    shm_inf.close()
+                    
+                    if ann_frame_queue is not None:
+                        shm_ann = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+                        np.ndarray(frame.shape, dtype=frame.dtype, buffer=shm_ann.buf)[:] = frame[:]
+                        ann_frame_queue.put_nowait({'shm_name': shm_ann.name, 'shape': frame.shape, 'dtype': frame.dtype, 'fps': fps, 'skipped_frames': skipped_frames})
+                        shm_ann.close()
+                except Exception: pass
                 
     if cap: cap.release()
 
@@ -335,20 +376,32 @@ def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_
         try:
             item = queue_obj.get(timeout=0.2)
             if item is None: break
-            frame, input_fps, duplicates = item
             
-            if writer is None:
-                h, w = frame.shape[:2]
-                fps = input_fps if input_fps > 0 else 30
-                writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+            shm = None
+            try:
+                shm = shared_memory.SharedMemory(name=item['shm_name'])
+                frame = np.ndarray(item['shape'], dtype=item['dtype'], buffer=shm.buf)
                 
-            for _ in range(duplicates):
-                writer.write(frame)
+                input_fps = item['fps']
+                duplicates = item['skipped_frames']
                 
-            if populate_ui and ui_queue is not None:
-                if not ui_queue.full():
-                    ui_frame = cv2.resize(frame, (1024, 576))
-                    ui_queue.put_nowait((ui_frame, 0))
+                if writer is None:
+                    h, w = frame.shape[:2]
+                    fps = input_fps if input_fps > 0 else 30
+                    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    
+                for _ in range(duplicates):
+                    writer.write(frame)
+                    
+                if populate_ui and ui_queue is not None:
+                    if not ui_queue.full():
+                        ui_frame = cv2.resize(frame, (1024, 576))
+                        ui_queue.put_nowait((ui_frame, 0))
+            finally:
+                if shm is not None:
+                    shm.close()
+                    shm.unlink()
+                    
         except queue.Empty:
             if not running_event.is_set() and queue_obj.empty(): break
     if writer: writer.release()
@@ -387,9 +440,18 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
                 
             try:
                 frame_item = ann_frame_queue.get(timeout=0.2)
-                frame, _, _ = frame_item
             except queue.Empty:
                 continue
+
+            shm = None
+            try:
+                shm = shared_memory.SharedMemory(name=frame_item['shm_name'])
+                frame_arr = np.ndarray(frame_item['shape'], dtype=frame_item['dtype'], buffer=shm.buf)
+                frame = frame_arr.copy()
+            finally:
+                if shm is not None:
+                    shm.close()
+                    shm.unlink()
 
             for i in range(len(ids)):
                 box = boxes[i]
@@ -649,6 +711,22 @@ class AttendanceApp(ctk.CTk):
             self.cam1_cmd_q.put('STOP')
         if hasattr(self, 'cam2_cmd_q') and self.cam2_cmd_q:
             self.cam2_cmd_q.put('STOP')
+
+        # Safely detach and purge pending SharedMemory scopes actively lodged in queues!
+        for q_name in ['cam1_inf_q', 'cam2_inf_q', 'cam1_raw_q', 'cam2_raw_q', 'cam1_ann_frame_q', 'cam2_ann_frame_q']:
+            if hasattr(self, q_name) and getattr(self, q_name):
+                q = getattr(self, q_name)
+                while not q.empty():
+                    try: 
+                        item = q.get_nowait()
+                        if isinstance(item, dict) and 'shm_name' in item:
+                            try:
+                                shm = shared_memory.SharedMemory(name=item['shm_name'])
+                                shm.close()
+                                shm.unlink()
+                            except Exception: pass
+                    except queue.Empty: break
+
         if hasattr(self, 'cam1_ann_q') and self.cam1_ann_q:
             self.cam1_ann_q.put(None)
         if hasattr(self, 'cam2_ann_q') and self.cam2_ann_q:
