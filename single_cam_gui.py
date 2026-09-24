@@ -220,7 +220,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                                 laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
                                 laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
                                 
-                                mask = laplacian_var > 7.0
+                                mask = laplacian_var > 5.0
                                 mask_list = mask.cpu().tolist()
                                 valid_batch_tensor = batch_tensor[mask]
                                 valid_batch_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if mask_list[k]]
@@ -518,10 +518,11 @@ class AttendanceApp(ctk.CTk):
 
     def ptz_command_worker(self):
         while True:
-            url = self.ptz_cmd_queue.get()
-            if url == "QUIT": break
+            payload = self.ptz_cmd_queue.get()
+            if payload == "QUIT": break
             try:
-                requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
+                url = f"http://{CAMERA_IP}/RPC2"
+                requests.post(url, json=payload, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
             except Exception:
                 pass
         
@@ -580,17 +581,13 @@ class AttendanceApp(ctk.CTk):
         btn_right = ctk.CTkButton(self.manual_ptz_frame, text="Right", width=50)
         btn_zi = ctk.CTkButton(self.manual_ptz_frame, text="Zoom In", width=50)
         btn_zo = ctk.CTkButton(self.manual_ptz_frame, text="Zoom Out", width=50)
-        btn_fi = ctk.CTkButton(self.manual_ptz_frame, text="Focus In", width=50)
-        btn_fo = ctk.CTkButton(self.manual_ptz_frame, text="Focus Out", width=50)
-
-        for btn, cmd, stop_cmd in [
-            (btn_up, "up", "ptzstop"), (btn_down, "down", "ptzstop"), (btn_left, "left", "ptzstop"), 
-            (btn_right, "right", "ptzstop"), (btn_zi, "zoomin", "zoomstop"), (btn_zo, "zoomout", "zoomstop"), 
-            (btn_fi, "focusin", "focusstop"), (btn_fo, "focusout", "focusstop")
+        for btn, code in [
+            (btn_up, "Up"), (btn_down, "Down"), (btn_left, "Left"), 
+            (btn_right, "Right"), (btn_zi, "ZoomTele"), (btn_zo, "ZoomWide")
         ]:
             for widget in [btn, btn._canvas, btn._text_label]:
-                widget.bind("<ButtonPress-1>", lambda e, c=cmd: self.manual_ptz(c))
-                widget.bind("<ButtonRelease-1>", lambda e, sc=stop_cmd: self.manual_ptz(sc))
+                widget.bind("<ButtonPress-1>", lambda e, c=code: self.manual_ptz("ptz.start", c))
+                widget.bind("<ButtonRelease-1>", lambda e, c=code: self.manual_ptz("ptz.stop", c))
 
         btn_up.grid(row=0, column=1, padx=2, pady=2)
         btn_down.grid(row=2, column=1, padx=2, pady=2)
@@ -598,8 +595,6 @@ class AttendanceApp(ctk.CTk):
         btn_right.grid(row=1, column=2, padx=2, pady=2)
         btn_zi.grid(row=0, column=3, padx=2, pady=2)
         btn_zo.grid(row=2, column=3, padx=2, pady=2)
-        btn_fi.grid(row=0, column=4, padx=2, pady=2)
-        btn_fo.grid(row=2, column=4, padx=2, pady=2)
             
         self.start_btn = ctk.CTkButton(self.sidebar_frame, text="Execute Bound Loop", command=self.start_tracking)
         self.start_btn.pack(pady=20, padx=20)
@@ -740,10 +735,17 @@ class AttendanceApp(ctk.CTk):
             while self.running_event.is_set() and (time.perf_counter() - t_start) < duration:
                 time.sleep(0.1)
 
-    def manual_ptz(self, command):
-        ip = CAMERA_IP
-        url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&{command}"
-        self.ptz_cmd_queue.put(url)
+    def manual_ptz(self, method, code):
+        payload = {
+            "method": method,
+            "params": {
+                "code": code,
+                "arg1": 5,
+                "arg2": 0,
+                "arg3": 0
+            }
+        }
+        self.ptz_cmd_queue.put(payload)
 
     def update_gui_frame(self):
         if not self.running_event.is_set():
