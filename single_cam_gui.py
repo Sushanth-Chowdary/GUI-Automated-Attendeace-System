@@ -41,7 +41,7 @@ PROTOCOLS = {
     8: {"name": "40-Minute", "cam": 295}
 }
 
-CONFIDENCE_THRESHOLD = 0.79
+CONFIDENCE_THRESHOLD = 0.75
 FRAME_SKIP = 1
 FRAMES_PER_VOTE = 5
 
@@ -220,7 +220,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                                 laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
                                 laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
                                 
-                                mask = laplacian_var > 1.0
+                                mask = laplacian_var > 7.0
                                 mask_list = mask.cpu().tolist()
                                 valid_batch_tensor = batch_tensor[mask]
                                 valid_batch_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if mask_list[k]]
