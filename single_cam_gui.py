@@ -17,7 +17,7 @@ import torchvision.transforms as transforms
 import torchvision.ops as ops
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
-from requests.auth import HTTPBasicAuth
+from requests.auth import HTTPDigestAuth
 import multiprocessing as mp
 import multiprocessing.shared_memory as shared_memory
 
@@ -518,11 +518,10 @@ class AttendanceApp(ctk.CTk):
 
     def ptz_command_worker(self):
         while True:
-            payload = self.ptz_cmd_queue.get()
-            if payload == "QUIT": break
+            url = self.ptz_cmd_queue.get()
+            if url == "QUIT": break
             try:
-                url = f"http://{CAMERA_IP}/RPC2"
-                requests.post(url, json=payload, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=3)
+                requests.get(url, auth=HTTPDigestAuth(USERNAME, PASSWORD), timeout=3)
             except Exception:
                 pass
         
@@ -586,8 +585,8 @@ class AttendanceApp(ctk.CTk):
             (btn_right, "Right"), (btn_zi, "ZoomTele"), (btn_zo, "ZoomWide")
         ]:
             for widget in [btn, btn._canvas, btn._text_label]:
-                widget.bind("<ButtonPress-1>", lambda e, c=code: self.manual_ptz("ptz.start", c))
-                widget.bind("<ButtonRelease-1>", lambda e, c=code: self.manual_ptz("ptz.stop", c))
+                widget.bind("<ButtonPress-1>", lambda e, c=code: self.manual_ptz("start", c))
+                widget.bind("<ButtonRelease-1>", lambda e, c=code: self.manual_ptz("stop", c))
 
         btn_up.grid(row=0, column=1, padx=2, pady=2)
         btn_down.grid(row=2, column=1, padx=2, pady=2)
@@ -723,8 +722,8 @@ class AttendanceApp(ctk.CTk):
     def ptz_runner(self, ip, presets, duration):
         for preset in presets:
             if not self.running_event.is_set(): break
-            url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&{preset}"
-            try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=5)
+            url = f"http://{ip}/cgi-bin/ptz.cgi?action=start&channel=1&code=GotoPreset&arg1=0&arg2={preset}&arg3=0"
+            try: requests.get(url, auth=HTTPDigestAuth(USERNAME, PASSWORD), timeout=5)
             except: pass
             
             t_mechanical = time.perf_counter()
@@ -735,17 +734,9 @@ class AttendanceApp(ctk.CTk):
             while self.running_event.is_set() and (time.perf_counter() - t_start) < duration:
                 time.sleep(0.1)
 
-    def manual_ptz(self, method, code):
-        payload = {
-            "method": method,
-            "params": {
-                "code": code,
-                "arg1": 5,
-                "arg2": 0,
-                "arg3": 0
-            }
-        }
-        self.ptz_cmd_queue.put(payload)
+    def manual_ptz(self, action, code):
+        url = f"http://{CAMERA_IP}/cgi-bin/ptz.cgi?action={action}&channel=1&code={code}&arg1=5&arg2=0&arg3=0"
+        self.ptz_cmd_queue.put(url)
 
     def update_gui_frame(self):
         if not self.running_event.is_set():
