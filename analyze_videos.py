@@ -4,7 +4,7 @@ import pandas as pd
 
 # The default directory where raw videos are saved in main_gui.py
 VIDEO_DIR = "VIDEOS"
-OUTPUT_REPORT = "video_protocols_report.csv"
+OUTPUT_REPORT = "video_protocols_report_fixed.csv"
 
 def format_time(seconds):
     """Converts seconds into MM:SS format."""
@@ -32,7 +32,8 @@ def categorize_protocol(duration_sec):
         "40-Minute Protocol": 40 * 60
     }
 
-    tolerance = 15  # seconds variance allowed (+/-)
+    # Increased tolerance to 45 seconds to account for observed system lag
+    tolerance = 45 
 
     # Check if it matches a standard protocol
     for name, expected_sec in protocols.items():
