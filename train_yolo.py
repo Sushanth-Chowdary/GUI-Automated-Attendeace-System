@@ -34,7 +34,6 @@ def crop_standard(img, box):
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
-# Using your optimized TensorRT engine
 yolo_model = YOLO('yolov8n-face.engine', task='detect') 
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
