@@ -88,6 +88,8 @@ ATTENDANCE_ROOT = next((cr for cr in candidate_roots if os.path.exists(cr)), os.
 
 FEATURE_CACHE_DIR = os.path.join(ATTENDANCE_ROOT, "feature_cache")
 MINE_OUTPUT_DIR   = os.path.join(ATTENDANCE_ROOT, "MINE")
+os.makedirs(FEATURE_CACHE_DIR, exist_ok=True)
+os.makedirs(MINE_OUTPUT_DIR, exist_ok=True)
 
 MAX_STAGE1_WORKERS = 4
 MAX_PHASE2_WORKERS = min(8, max(2, (os.cpu_count() or 8) // 4))
@@ -338,6 +340,33 @@ ext_device     = None
 ext_use_half   = False
 
 
+def is_valid_cache_for_test(cache_path):
+    """Verifies cache exists, is non-empty, and has frame_boxes for video rendering."""
+    if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 1024):
+        return False
+    try:
+        data = torch.load(cache_path, map_location='cpu', weights_only=False)
+        if not isinstance(data, dict):
+            return False
+        if len(data) > 0:
+            first_track = next(iter(data.values()))
+            if 'frame_boxes' not in first_track:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def get_cache_path(cache_dir, stem):
+    p1 = os.path.join(cache_dir, f"{stem}_features.pt")
+    if os.path.exists(p1) and os.path.getsize(p1) > 1024:
+        return p1
+    p2 = os.path.join(cache_dir, f"{stem}_raw_features.pt")
+    if os.path.exists(p2) and os.path.getsize(p2) > 1024:
+        return p2
+    return p1
+
+
 def init_stage1_worker():
     global ext_yolo_model, ext_resnet, ext_device, ext_use_half
     cv2.setNumThreads(1)
@@ -358,7 +387,7 @@ def extract_video_features_worker(video_filename, input_dir, cache_dir, progress
     video_stem = os.path.splitext(video_filename)[0]
     cache_path = os.path.join(cache_dir, f"{video_stem}_features.pt")
 
-    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 1024:
+    if is_valid_cache_for_test(cache_path):
         progress_q.put({"type": "skip", "file": video_filename})
         return video_filename, cache_path, "Skipped"
 
@@ -589,33 +618,6 @@ def run_stage1_dashboard(progress_q, total_videos, stop_event):
             time.sleep(0.2)
 
 
-def is_valid_cache_for_test(cache_path):
-    """Verifies cache exists, is non-empty, and has frame_boxes for video rendering."""
-    if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 1024):
-        return False
-    try:
-        data = torch.load(cache_path, map_location='cpu', weights_only=False)
-        if not isinstance(data, dict):
-            return False
-        if len(data) > 0:
-            first_track = next(iter(data.values()))
-            if 'frame_boxes' not in first_track:
-                return False
-        return True
-    except Exception:
-        return False
-
-
-def get_cache_path(cache_dir, stem):
-    p1 = os.path.join(cache_dir, f"{stem}_features.pt")
-    if os.path.exists(p1) and os.path.getsize(p1) > 1024:
-        return p1
-    p2 = os.path.join(cache_dir, f"{stem}_raw_features.pt")
-    if os.path.exists(p2) and os.path.getsize(p2) > 1024:
-        return p2
-    return p1
-
-
 def ensure_all_features_cached(target_videos, input_dir, cache_dir, ctx):
     os.makedirs(cache_dir, exist_ok=True)
     ready_count = 0
@@ -729,9 +731,9 @@ def process_video_phase2(video_filename, input_dir, cache_dir, output_dir, progr
         return video_filename, "Skipped"
 
     cpath = get_cache_path(cache_dir, video_stem)
-    if not (os.path.exists(cpath) and os.path.getsize(cpath) > 1024):
-        progress_q.put({"type": "error", "file": video_filename, "err": "Cache file missing"})
-        return video_filename, "Error: Cache missing"
+    if not is_valid_cache_for_test(cpath):
+        progress_q.put({"type": "error", "file": video_filename, "err": "Cache file missing or invalid (no frame_boxes)"})
+        return video_filename, "Error: Cache missing or invalid"
 
     raw_tracks = torch.load(cpath, map_location='cpu', weights_only=False)
 
@@ -781,7 +783,7 @@ def process_video_phase2(video_filename, input_dir, cache_dir, output_dir, progr
 
                 q_mask = (w_norms >= NORM_QUALITY_THRESHOLD)
                 if not q_mask.any():
-                    all_preds.extend(["Unknown"] * FRAMES_PER_VOTE)
+                    all_preds.append("Unknown")
                     track_timeline[t_id].append((w_frame, "Unknown", 0.0))
                     continue
 
@@ -798,7 +800,7 @@ def process_video_phase2(video_filename, input_dir, cache_dir, output_dir, progr
                 conf_score = float(max_sim.item())
                 winner = p2_target_names[p2_y_real[max_idx.item()]] if conf_score >= CONFIDENCE_THRESHOLD else "Unknown"
 
-                all_preds.extend([winner] * FRAMES_PER_VOTE)
+                all_preds.append(winner)
                 track_timeline[t_id].append((w_frame, winner, conf_score))
 
         # Gate Condition Evaluation

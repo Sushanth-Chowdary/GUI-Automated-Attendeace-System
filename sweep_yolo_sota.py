@@ -150,6 +150,8 @@ def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir):
 
     if not os.path.exists(name_mapping_path):
         raise FileNotFoundError(f"Could not find name_mapping.csv at {name_mapping_path}")
+    if not os.path.exists(full_true_path):
+        raise FileNotFoundError(f"Could not find filtered_true_attendance.csv at {full_true_path}")
 
     name_map_df = pd.read_csv(name_mapping_path).dropna(subset=['Short_Name', 'Roll_Name'])
     name_map_df = name_map_df[name_map_df['Short_Name'].astype(str).str.strip() != '']
@@ -160,28 +162,27 @@ def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir):
 
     required_dates = sorted(list({v.split('_')[0] for v in target_videos}))
 
+    full_df = pd.read_csv(full_true_path)
+    full_df.columns = [str(c).strip().replace('-', '') for c in full_df.columns]
+    full_df_cols = set(full_df.columns)
+
+    available_dates = [d for d in required_dates if d in full_df_cols]
+    missing_dates = [d for d in required_dates if d not in full_df_cols]
+
     need_create = True
     if os.path.exists(subset_true_path):
         existing_df = pd.read_csv(subset_true_path)
         existing_cols = [str(c).strip().replace('-', '') for c in existing_df.columns]
-        if any(d in existing_cols for d in required_dates):
+        if all(d in existing_cols for d in available_dates):
             console.print(f"[bold green]OK True Attendance for all videos already exists:[/bold green] {subset_true_path}")
             need_create = False
 
     if need_create:
-        if not os.path.exists(full_true_path):
-            raise FileNotFoundError(f"Could not find filtered_true_attendance.csv at {full_true_path}")
-
-        full_df = pd.read_csv(full_true_path)
-        full_df.columns = [str(c).strip().replace('-', '') for c in full_df.columns]
-
-        base_cols = list(full_df.columns[:2])
-        date_cols = [d for d in required_dates if d in full_df.columns]
-        missing_dates = [d for d in required_dates if d not in full_df.columns]
         if missing_dates:
             console.print(f"[bold yellow]Note:[/bold yellow] {len(missing_dates)} video dates not found in filtered_true_attendance.csv (skipped during evaluation).")
 
-        subset_df = full_df[base_cols + date_cols].copy()
+        base_cols = list(full_df.columns[:2])
+        subset_df = full_df[base_cols + available_dates].copy()
         subset_df.to_csv(subset_true_path, index=False)
         console.print(f"[bold green]OK Saved True Attendance to:[/bold green] {subset_true_path}")
 
@@ -939,6 +940,8 @@ def _eval_track_batch(
         a_conf_h = b_conf_thresh[act_idx].half()
 
         for w in range(num_full_windows):
+            a_totals += 1
+
             w_embs  = embs_w[w]        # (fpv, 512) half
             w_norms = norms_w[:, w, :] # (A, fpv) float
 
@@ -964,13 +967,10 @@ def _eval_track_batch(
 
             is_conf = (max_sim >= a_conf_h) & any_valid
 
-            valid_idx = any_valid.nonzero(as_tuple=True)[0]
-            a_totals[valid_idx] += fpv
-
             if is_conf.any():
                 conf_idx = is_conf.nonzero(as_tuple=True)[0]
                 conf_cls = pred_class[conf_idx]
-                a_votes[conf_idx, conf_cls] += float(fpv)
+                a_votes[conf_idx, conf_cls] += 1.0
 
         vote_counts[act_idx] += a_votes
         total_preds[act_idx] += a_totals
