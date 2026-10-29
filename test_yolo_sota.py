@@ -139,10 +139,10 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
             total_samples = len(all_preds)
             sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0
 
-            status = "Passed" if (total_frames >= 45 and
-                                  total_samples >= 15 and
-                                  sample_ratio >= 0.33 and
-                                  win_ratio >= 0.52) else "Failed"
+            status = "Passed" if (total_frames >= 30 and
+                                  total_samples >= 20 and
+                                  sample_ratio >= 0.40 and
+                                  win_ratio >= 0.45) else "Failed"
         else:
             winner = "Unknown"
             status = "Failed"
@@ -375,11 +375,11 @@ y_real = []
 device = None
 use_half = False
 
-CONFIDENCE_THRESHOLD = 0.32      # Recalibrated for AdaFace 512-D angular margin
-FRAME_SKIP = 1
+CONFIDENCE_THRESHOLD = 0.40    
+FRAME_SKIP = 3
 FRAMES_PER_VOTE = 5
-NORM_QUALITY_THRESHOLD = 6.0
-EMA_MOMENTUM = 0.7
+NORM_QUALITY_THRESHOLD = 7.0
+EMA_MOMENTUM = 0.85
 SOFTMAX_TAU = 5.0
 
 
@@ -521,7 +521,7 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                     box_h = boxes[:, 3] - boxes[:, 1]
                     aspect_ratios = box_w / (box_h + 1e-6)
 
-                    valid_mask = (box_w >= 50) & (box_h >= 50) & (aspect_ratios >= 0.55) & (aspect_ratios <= 1.55)
+                    valid_mask = (box_w >= 60) & (box_h >= 60) & (aspect_ratios >= 0.7) & (aspect_ratios <= 1.7)
 
                     if valid_mask.any():
                         valid_boxes = boxes[valid_mask].clone()
