@@ -18,8 +18,6 @@
 # ==============================================================================
 
 import os
-# Strictly isolate execution to GPU 0
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -108,10 +106,11 @@ ALL_PARAM_KEYS = [
 ]
 
 MAX_EPOCHS = 6
-BASE_MIN_BOX_SIZE = 45.0  # Stage 1 base feature extraction threshold
+BASE_MIN_BOX_SIZE = 45.0  
 FRAME_SKIP = 1
 MAX_STAGE1_WORKERS = 4
-GPU_BATCH_SIZE = 256
+GPU_BATCH_SIZE = 1024
+ACTIVE_GPUS = [0, 1, 2]
 
 # ==========================================
 # 2. STANDARDIZED DIRECTORY PATHS
@@ -204,7 +203,7 @@ def write_live_progress(sweep_dir, pid, epoch, max_epochs, completed_epoch, tota
         "pid": pid,
         "epoch": epoch,
         "max_epochs": max_epochs,
-        "gpu_device": 0,
+        "active_gpus": ACTIVE_GPUS,
         "gpu_batch_size": GPU_BATCH_SIZE,
         "completed_in_epoch": completed_epoch,
         "total_in_epoch": total_epoch,
@@ -228,10 +227,10 @@ def write_live_progress(sweep_dir, pid, epoch, max_epochs, completed_epoch, tota
 
     txt_content = (
         f"=================================================================\n"
-        f"DGX A100 GPU HYPERPARAMETER OPTIMIZER LIVE MONITOR\n"
+        f"DGX A100 MULTI-GPU HYPERPARAMETER OPTIMIZER LIVE MONITOR\n"
         f"Updated  : {status_data['updated_at']}\n"
         f"=================================================================\n"
-        f"PID      : {pid}  |  GPU: 0 (CUDA:0)  |  Batch: {GPU_BATCH_SIZE} combos/batch\n"
+        f"PID      : {pid}  |  GPUs: {ACTIVE_GPUS}  |  Batch: {GPU_BATCH_SIZE} combos/batch per GPU\n"
         f"Epoch    : {epoch} / {max_epochs}  [{bar_str}] {pct:6.2f}%\n"
         f"Combos   : {completed_epoch:,} / {total_epoch:,} in Epoch  ({total_tested:,} total tested)\n"
         f"Speed    : {combos_per_sec:.2f} combos/sec\n"
@@ -800,9 +799,10 @@ def ensure_all_features_cached(target_videos, input_dir, cache_dir, ctx):
 # ==========================================
 # 6. STAGE 2: GPU-ACCELERATED BATCH EVALUATION
 # ==========================================
-def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true_dict, device):
+def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true_dict, device=None):
     """
-    Loads FAISS gallery and all valid cached video track tensors onto GPU 0 once.
+    Loads FAISS gallery and all valid cached video track tensors into CPU memory.
+    Active GPU workers will load/transfer tensors directly to their respective GPU device.
     """
     faiss_index_path = os.path.join(base_dir, 'face_attendance_sota_faiss.bin')
     meta_path        = os.path.join(base_dir, 'face_attendance_sota_meta.pkl')
@@ -810,7 +810,7 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
     if not os.path.exists(faiss_index_path) or not os.path.exists(meta_path):
         raise FileNotFoundError("Run 'python train_yolo_sota.py' first to build FAISS gallery and metadata!")
 
-    console.print(f"[cyan]  Loading FAISS gallery -> GPU 0 ({device})...[/cyan]")
+    console.print(f"[cyan]  Loading FAISS gallery -> CPU memory...[/cyan]")
     index = faiss.read_index(faiss_index_path)
     index.nprobe = 20
     try:
@@ -819,8 +819,7 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
         index.make_direct_map()
         ref_np = np.array([index.reconstruct(i) for i in range(index.ntotal)])
 
-    ref_embs = F.normalize(torch.from_numpy(ref_np).float(), p=2, dim=1).half().to(device)
-    ref_embs_t = ref_embs.t().contiguous()
+    ref_embs = F.normalize(torch.from_numpy(ref_np).float(), p=2, dim=1).half()
 
     with open(meta_path, 'rb') as f:
         meta_data = pickle.load(f)
@@ -828,8 +827,8 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
     y_real       = meta_data['y_real']
     roll_names   = [short_to_roll.get(n.strip(), n.strip()) for n in target_names]
 
-    console.print(f"[cyan]  Loading feature caches for {len(target_videos)} videos -> GPU 0...[/cyan]")
-    gpu_videos = []
+    console.print(f"[cyan]  Loading feature caches for {len(target_videos)} videos -> CPU memory...[/cyan]")
+    cpu_videos = []
     total_cached_frames = 0
 
     for v in target_videos:
@@ -840,7 +839,7 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
             continue
 
         raw_tracks = torch.load(cpath, map_location='cpu', weights_only=False)
-        gpu_tracks = []
+        video_tracks = []
         max_vid_frame = 0
 
         for t_id in sorted(raw_tracks.keys()):
@@ -853,20 +852,20 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
             frames_alive = int(td.get('frames_alive', 0))
             max_vid_frame = max(max_vid_frame, frames_alive)
 
-            gpu_tracks.append({
+            video_tracks.append({
                 'frames_alive': frames_alive,
-                'box_w': td['box_w'].to(device),
-                'box_h': td['box_h'].to(device),
-                'embs' : embs.to(device),
-                'norms': norms.to(device),
+                'box_w': td['box_w'].float(),
+                'box_h': td['box_h'].float(),
+                'embs' : embs,
+                'norms': norms,
             })
 
-        if gpu_tracks:
+        if video_tracks:
             total_cached_frames += max_vid_frame
-            gpu_videos.append({'date_str': date_str, 'tracks': gpu_tracks})
+            cpu_videos.append({'date_str': date_str, 'tracks': video_tracks})
 
-    console.print(f"[bold green]OK Loaded {len(gpu_videos)} video caches onto GPU ({total_cached_frames:,} total frames)[/bold green]")
-    return gpu_videos, ref_embs_t, target_names, y_real, roll_names, total_cached_frames
+    console.print(f"[bold green]OK Loaded {len(cpu_videos)} video caches into CPU memory ({total_cached_frames:,} total frames)[/bold green]")
+    return cpu_videos, ref_embs, target_names, y_real, roll_names, total_cached_frames
 
 
 @torch.no_grad()
@@ -1113,6 +1112,113 @@ def evaluate_combo_batch_gpu(
 
 
 # ==========================================
+# MULTI-GPU STAGE 2 WORKER EVALUATION POOL
+# ==========================================
+_STAGE2_WORKER_DATA = {}
+_STAGE2_GPU_CACHE   = {}
+
+
+def init_stage2_sweep_worker(cpu_videos, ref_embs_cpu, target_names, y_real, roll_names, true_dict, short_to_roll):
+    """
+    Worker initializer: receives shared CPU tensors and reference data once per worker process.
+    """
+    global _STAGE2_WORKER_DATA
+    _STAGE2_WORKER_DATA = {
+        'cpu_videos': cpu_videos,
+        'ref_embs_cpu': ref_embs_cpu,
+        'target_names': target_names,
+        'y_real': y_real,
+        'roll_names': roll_names,
+        'true_dict': true_dict,
+        'short_to_roll': short_to_roll,
+    }
+
+
+def chunk_combinations(items, num_chunks):
+    """
+    Chunks a list of (combo_id, params) into equal parts based on num_chunks.
+    """
+    if not items or num_chunks <= 0:
+        return []
+    k, m = divmod(len(items), num_chunks)
+    chunks = []
+    for i in range(num_chunks):
+        start = i * k + min(i, m)
+        end = (i + 1) * k + min(i + 1, m)
+        if start < end:
+            chunks.append(items[start:end])
+    return chunks
+
+
+def worker_evaluate_chunk(chunk, gpu_id):
+    """
+    Worker wrapper function that takes its assigned chunk of combinations and its assigned gpu_id,
+    sets device = torch.device(f'cuda:{gpu_id}'), and runs the batched evaluation
+    (evaluate_combo_batch_gpu) exclusively on that GPU.
+    """
+    global _STAGE2_WORKER_DATA, _STAGE2_GPU_CACHE
+
+    device = torch.device(f'cuda:{gpu_id}')
+    torch.cuda.set_device(device)
+
+    # Transfer shared CPU tensors to this worker's GPU once and cache in VRAM
+    if gpu_id not in _STAGE2_GPU_CACHE:
+        c_videos     = _STAGE2_WORKER_DATA['cpu_videos']
+        c_ref        = _STAGE2_WORKER_DATA['ref_embs_cpu']
+        ref_embs_t   = c_ref.to(device, non_blocking=True).t().contiguous()
+        gpu_videos   = []
+        for v in c_videos:
+            gpu_tracks = []
+            for td in v['tracks']:
+                gpu_tracks.append({
+                    'frames_alive': td['frames_alive'],
+                    'box_w': td['box_w'].to(device, non_blocking=True),
+                    'box_h': td['box_h'].to(device, non_blocking=True),
+                    'embs' : td['embs'].to(device, non_blocking=True),
+                    'norms': td['norms'].to(device, non_blocking=True),
+                })
+            gpu_videos.append({'date_str': v['date_str'], 'tracks': gpu_tracks})
+        _STAGE2_GPU_CACHE[gpu_id] = (gpu_videos, ref_embs_t)
+    else:
+        gpu_videos, ref_embs_t = _STAGE2_GPU_CACHE[gpu_id]
+
+    target_names  = _STAGE2_WORKER_DATA['target_names']
+    y_real        = _STAGE2_WORKER_DATA['y_real']
+    roll_names    = _STAGE2_WORKER_DATA['roll_names']
+    true_dict     = _STAGE2_WORKER_DATA['true_dict']
+    short_to_roll = _STAGE2_WORKER_DATA['short_to_roll']
+
+    num_batches = (len(chunk) + GPU_BATCH_SIZE - 1) // GPU_BATCH_SIZE
+    chunk_results = []
+
+    for b_i in range(num_batches):
+        b_start = b_i * GPU_BATCH_SIZE
+        b_end   = min(b_start + GPU_BATCH_SIZE, len(chunk))
+        combo_batch = chunk[b_start:b_end]
+
+        try:
+            batch_results = evaluate_combo_batch_gpu(
+                combo_batch, gpu_videos, ref_embs_t, target_names,
+                y_real, roll_names, true_dict, short_to_roll, device
+            )
+        except torch.cuda.OutOfMemoryError:
+            batch_results = []
+            half = max(1, len(combo_batch) // 2)
+            for s_start in range(0, len(combo_batch), half):
+                sub = combo_batch[s_start:s_start + half]
+                torch.cuda.empty_cache()
+                sub_res = evaluate_combo_batch_gpu(
+                    sub, gpu_videos, ref_embs_t, target_names,
+                    y_real, roll_names, true_dict, short_to_roll, device
+                )
+                batch_results.extend(sub_res)
+
+        chunk_results.extend(batch_results)
+
+    return chunk_results
+
+
+# ==========================================
 # 7. VISUALIZATIONS & LEADERBOARD REPORTING
 # ==========================================
 def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
@@ -1250,27 +1356,36 @@ if __name__ == '__main__':
     mp.freeze_support()
     ctx = mp.get_context('spawn')
     main_pid = os.getpid()
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    gpu_desc = ", ".join([f"cuda:{g}" for g in ACTIVE_GPUS])
 
     console.print(Panel(
         f"[bold yellow]Main Process ID (PID) for Excel Sheet:[/bold yellow] [bold white]{main_pid}[/bold white]\n"
-        f"[bold cyan]Hardware Isolation:[/bold cyan] CUDA_VISIBLE_DEVICES='0' ({device})\n"
+        f"[bold cyan]Multi-GPU Acceleration:[/bold cyan] Active GPUs: {ACTIVE_GPUS} ({gpu_desc})\n"
         f"[bold green]Shared Feature Cache:[/bold green] {FEATURE_CACHE_DIR}\n"
         f"[bold magenta]Sweep Output Directory:[/bold magenta] {SWEEP_OUTPUT_DIR}",
         title="DGX A100 GPU Hyperparameter Optimizer (Copy PID to SPCLAB-DGX_Utilization.xlsx)",
         expand=False
     ))
 
-    # 1. Discover all videos from VIDEOS/
+    # 1. Discover all videos from VIDEOS/ or fallback to FEATURE_CACHE_DIR
     video_extensions = ('.mp4', '.mkv', '.avi', '.mov')
-    target_videos = sorted([
-        f for f in os.listdir(INPUT_VIDEOS_DIR)
-        if f.lower().endswith(video_extensions) and not f.startswith('.')
-    ])
-    console.print(f"[bold cyan]Discovered {len(target_videos)} videos in '{INPUT_VIDEOS_DIR}'.[/bold cyan]\n")
+    try:
+        target_videos = sorted([
+            f for f in os.listdir(INPUT_VIDEOS_DIR)
+            if f.lower().endswith(video_extensions) and not f.startswith('.')
+        ])
+        console.print(f"[bold cyan]Discovered {len(target_videos)} videos in '{INPUT_VIDEOS_DIR}'.[/bold cyan]\n")
+    except FileNotFoundError:
+        console.print(f"[bold yellow]'{INPUT_VIDEOS_DIR}' not found. Falling back to feature cache: '{FEATURE_CACHE_DIR}'...[/bold yellow]")
+        target_videos = sorted([
+            (f[:-len('_features.pt')] + '.mp4')
+            for f in os.listdir(FEATURE_CACHE_DIR)
+            if f.endswith('_features.pt') and not f.startswith('.')
+        ])
+        console.print(f"[bold cyan]Discovered {len(target_videos)} cached pseudo-videos in '{FEATURE_CACHE_DIR}'.[/bold cyan]\n")
 
     if not target_videos:
-        console.print("[bold red]No videos found in VIDEOS folder![/bold red]")
+        console.print("[bold red]No videos found in VIDEOS folder or feature cache![/bold red]")
         sys.exit(0)
 
     # 2. Extract or load ground truth for all videos
@@ -1287,14 +1402,14 @@ if __name__ == '__main__':
     # 3. Build or verify Stage 1 feature cache
     ensure_all_features_cached(target_videos, INPUT_VIDEOS_DIR, FEATURE_CACHE_DIR, ctx)
 
-    # 4. Load all cached video features and FAISS gallery directly onto GPU 0 once
-    console.print("\n[bold yellow]Loading video caches and gallery onto GPU 0...[/bold yellow]")
-    gpu_videos, ref_embs_t, target_names, y_real, roll_names, total_cached_frames = _load_gpu_sweep_data(
-        target_videos, FEATURE_CACHE_DIR, BASE_DIR, short_to_roll, true_dict, device
+    # 4. Load all cached video features and FAISS gallery directly into CPU shared memory
+    console.print("\n[bold yellow]Loading video caches and gallery into CPU shared memory...[/bold yellow]")
+    cpu_videos, ref_embs_cpu, target_names, y_real, roll_names, total_cached_frames = _load_gpu_sweep_data(
+        target_videos, FEATURE_CACHE_DIR, BASE_DIR, short_to_roll, true_dict
     )
 
-    if not gpu_videos:
-        console.print("[bold red]No valid video caches loaded onto GPU! Exiting.[/bold red]")
+    if not cpu_videos:
+        console.print("[bold red]No valid video caches loaded! Exiting.[/bold red]")
         sys.exit(0)
 
     # 5. Initialize Progressive Epoch Optimizer
@@ -1353,209 +1468,203 @@ if __name__ == '__main__':
     t_opt_start = time.perf_counter()
 
     console.print(f"\n[bold white]Starting Epoch-Based Coordinate Ascent Optimizer (MAX_EPOCHS={MAX_EPOCHS}):[/bold white]")
-    console.print(f"  * GPU: CUDA:0  |  Batch Size: {GPU_BATCH_SIZE} combos/batch")
-    console.print(f"  * Cached Videos on GPU: {len(gpu_videos)}  ({total_cached_frames:,} total frames)\n")
+    console.print(f"  * Parallel GPUs: {ACTIVE_GPUS}  |  Batch Size: {GPU_BATCH_SIZE} combos/batch per GPU")
+    console.print(f"  * Cached Videos in Memory: {len(cpu_videos)}  ({total_cached_frames:,} total frames)\n")
 
-    # Outer Epoch Loop
-    for epoch in range(1, MAX_EPOCHS + 1):
-        epoch_start_time = time.perf_counter()
-        console.print(f"\n[bold cyan]=== Epoch {epoch} / {MAX_EPOCHS} ===[/bold cyan]")
-        console.print(f"[dim]Current center theta*: {theta_star}[/dim]")
-        console.print(f"[dim]Current steps: {current_steps}[/dim]")
+    # Multi-GPU ProcessPoolExecutor for Stage 2 Hyperparameter Evaluation
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=len(ACTIVE_GPUS),
+        mp_context=ctx,
+        initializer=init_stage2_sweep_worker,
+        initargs=(cpu_videos, ref_embs_cpu, target_names, y_real, roll_names, true_dict, short_to_roll)
+    ) as executor:
+        # Outer Epoch Loop
+        for epoch in range(1, MAX_EPOCHS + 1):
+            epoch_start_time = time.perf_counter()
+            console.print(f"\n[bold cyan]=== Epoch {epoch} / {MAX_EPOCHS} ===[/bold cyan]")
+            console.print(f"[dim]Current center theta*: {theta_star}[/dim]")
+            console.print(f"[dim]Current steps: {current_steps}[/dim]")
 
-        # 1. Generate candidate neighborhood around theta*
-        candidates = []
-        candidates.append(dict(theta_star))
+            # 1. Generate candidate neighborhood around theta*
+            candidates = []
+            candidates.append(dict(theta_star))
 
-        # 1D coordinate steps (theta_i +- Delta_i, theta_i +- 2*Delta_i)
-        for k, cfg in ACTIVE_VARS.items():
-            delta = current_steps[k]
-            for mult in [-2, -1, 1, 2]:
-                val = theta_star[k] + mult * delta
-                val = max(cfg["min"], min(cfg["max"], val))
-                cand = dict(theta_star)
-                cand[k] = int(round(val)) if cfg["is_int"] else round(val, 4)
-                candidates.append(cand)
-
-        # 2D pairwise interaction steps for TOP4_VARS
-        for k1, k2 in itertools.combinations(TOP4_VARS, 2):
-            cfg1, cfg2 = ACTIVE_VARS[k1], ACTIVE_VARS[k2]
-            d1, d2 = current_steps[k1], current_steps[k2]
-            for s1 in [-1, 1]:
-                for s2 in [-1, 1]:
-                    v1 = max(cfg1["min"], min(cfg1["max"], theta_star[k1] + s1 * d1))
-                    v2 = max(cfg2["min"], min(cfg2["max"], theta_star[k2] + s2 * d2))
+            # 1D coordinate steps (theta_i +- Delta_i, theta_i +- 2*Delta_i)
+            for k, cfg in ACTIVE_VARS.items():
+                delta = current_steps[k]
+                for mult in [-2, -1, 1, 2]:
+                    val = theta_star[k] + mult * delta
+                    val = max(cfg["min"], min(cfg["max"], val))
                     cand = dict(theta_star)
-                    cand[k1] = int(round(v1)) if cfg1["is_int"] else round(v1, 4)
-                    cand[k2] = int(round(v2)) if cfg2["is_int"] else round(v2, 4)
+                    cand[k] = int(round(val)) if cfg["is_int"] else round(val, 4)
                     candidates.append(cand)
 
-        # Deduplicate candidates
-        unique_epoch_candidates = []
-        seen_keys = set()
-        for c in candidates:
-            pk = param_key(c)
-            if pk not in seen_keys:
-                seen_keys.add(pk)
-                unique_epoch_candidates.append(c)
+            # 2D pairwise interaction steps for TOP4_VARS
+            for k1, k2 in itertools.combinations(TOP4_VARS, 2):
+                cfg1, cfg2 = ACTIVE_VARS[k1], ACTIVE_VARS[k2]
+                d1, d2 = current_steps[k1], current_steps[k2]
+                for s1 in [-1, 1]:
+                    for s2 in [-1, 1]:
+                        v1 = max(cfg1["min"], min(cfg1["max"], theta_star[k1] + s1 * d1))
+                        v2 = max(cfg2["min"], min(cfg2["max"], theta_star[k2] + s2 * d2))
+                        cand = dict(theta_star)
+                        cand[k1] = int(round(v1)) if cfg1["is_int"] else round(v1, 4)
+                        cand[k2] = int(round(v2)) if cfg2["is_int"] else round(v2, 4)
+                        candidates.append(cand)
 
-        # Filter against evaluated_cache
-        pending_candidates = []
-        for c in unique_epoch_candidates:
-            pk = param_key(c)
-            if pk in evaluated_cache:
-                row = evaluated_cache[pk]
-                c_acc = float(row.get("Overall_Accuracy", 0.0))
-                c_tp  = int(row.get("TP", 0))
-                c_fp  = int(row.get("FP", 0))
-                c_id  = int(row["Combo_ID"])
-                if (c_acc > best_acc_so_far) or (c_acc == best_acc_so_far and c_tp > best_tp_so_far) or (c_acc == best_acc_so_far and c_tp == best_tp_so_far and c_fp < best_fp_so_far):
-                    best_acc_so_far = c_acc
-                    best_tp_so_far  = c_tp
-                    best_fp_so_far  = c_fp
-                    best_cid_so_far = c_id
-                    best_params_so_far = {k: row[k] for k in ALL_PARAM_KEYS}
-            else:
-                pending_candidates.append(c)
+            # Deduplicate candidates
+            unique_epoch_candidates = []
+            seen_keys = set()
+            for c in candidates:
+                pk = param_key(c)
+                if pk not in seen_keys:
+                    seen_keys.add(pk)
+                    unique_epoch_candidates.append(c)
 
-        total_epoch_combos = len(unique_epoch_candidates)
-        already_evaluated_in_epoch = total_epoch_combos - len(pending_candidates)
+            # Filter against evaluated_cache
+            pending_candidates = []
+            for c in unique_epoch_candidates:
+                pk = param_key(c)
+                if pk in evaluated_cache:
+                    row = evaluated_cache[pk]
+                    c_acc = float(row.get("Overall_Accuracy", 0.0))
+                    c_tp  = int(row.get("TP", 0))
+                    c_fp  = int(row.get("FP", 0))
+                    c_id  = int(row["Combo_ID"])
+                    if (c_acc > best_acc_so_far) or (c_acc == best_acc_so_far and c_tp > best_tp_so_far) or (c_acc == best_acc_so_far and c_tp == best_tp_so_far and c_fp < best_fp_so_far):
+                        best_acc_so_far = c_acc
+                        best_tp_so_far  = c_tp
+                        best_fp_so_far  = c_fp
+                        best_cid_so_far = c_id
+                        best_params_so_far = {k: row[k] for k in ALL_PARAM_KEYS}
+                else:
+                    pending_candidates.append(c)
 
-        console.print(
-            f"Epoch {epoch}: {total_epoch_combos} candidate combinations "
-            f"({already_evaluated_in_epoch} cached, {len(pending_candidates)} pending evaluation)"
-        )
+            total_epoch_combos = len(unique_epoch_candidates)
+            already_evaluated_in_epoch = total_epoch_combos - len(pending_candidates)
 
-        improved_this_epoch = False
-
-        if pending_candidates:
-            # Set up Rich Progress Bar
-            progress = Progress(
-                SpinnerColumn(),
-                TextColumn("[bold cyan]{task.description}"),
-                BarColumn(bar_width=32),
-                MofNCompleteColumn(),
-                TextColumn("[bold yellow]{task.percentage:>5.1f}%"),
-                TimeRemainingColumn(),
-                TextColumn("[bold green]{task.fields[speed]}"),
-                TextColumn("[bold magenta]{task.fields[best]}"),
-                console=console,
-                refresh_per_second=5
+            console.print(
+                f"Epoch {epoch}: {total_epoch_combos} candidate combinations "
+                f"({already_evaluated_in_epoch} cached, {len(pending_candidates)} pending evaluation)"
             )
 
-            task_id = progress.add_task(
-                f"Epoch {epoch}/{MAX_EPOCHS}",
-                total=total_epoch_combos,
-                completed=already_evaluated_in_epoch,
-                speed="Starting GPU batch...",
-                best=f"Best: {best_acc_so_far:.2f}%" if best_cid_so_far else "Best: --"
-            )
+            improved_this_epoch = False
 
-            # Assign sequential combo IDs
-            pending_with_ids = []
-            for cand in pending_candidates:
-                max_combo_id += 1
-                pending_with_ids.append((max_combo_id, cand))
+            if pending_candidates:
+                # Set up Rich Progress Bar
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]{task.description}"),
+                    BarColumn(bar_width=32),
+                    MofNCompleteColumn(),
+                    TextColumn("[bold yellow]{task.percentage:>5.1f}%"),
+                    TimeRemainingColumn(),
+                    TextColumn("[bold green]{task.fields[speed]}"),
+                    TextColumn("[bold magenta]{task.fields[best]}"),
+                    console=console,
+                    refresh_per_second=5
+                )
 
-            num_batches = (len(pending_with_ids) + GPU_BATCH_SIZE - 1) // GPU_BATCH_SIZE
-            completed_in_epoch = already_evaluated_in_epoch
-            epoch_eval_count = 0
+                task_id = progress.add_task(
+                    f"Epoch {epoch}/{MAX_EPOCHS}",
+                    total=total_epoch_combos,
+                    completed=already_evaluated_in_epoch,
+                    speed="Starting GPU batch...",
+                    best=f"Best: {best_acc_so_far:.2f}%" if best_cid_so_far else "Best: --"
+                )
 
-            with progress:
-                for b_i in range(num_batches):
-                    b_start = b_i * GPU_BATCH_SIZE
-                    b_end   = min(b_start + GPU_BATCH_SIZE, len(pending_with_ids))
-                    combo_batch = pending_with_ids[b_start:b_end]
+                # Assign sequential combo IDs
+                pending_with_ids = []
+                for cand in pending_candidates:
+                    max_combo_id += 1
+                    pending_with_ids.append((max_combo_id, cand))
 
-                    b_t0 = time.perf_counter()
-                    try:
-                        batch_results = evaluate_combo_batch_gpu(
-                            combo_batch, gpu_videos, ref_embs_t, target_names,
-                            y_real, roll_names, true_dict, short_to_roll, device
+                completed_in_epoch = already_evaluated_in_epoch
+                epoch_eval_count = 0
+                epoch_eval_start = time.perf_counter()
+
+                # Chunk pending_with_ids into equal parts across ACTIVE_GPUS
+                chunks = chunk_combinations(pending_with_ids, len(ACTIVE_GPUS))
+                active_assignments = list(zip(chunks, ACTIVE_GPUS[:len(chunks)]))
+
+                with progress:
+                    futures = [
+                        executor.submit(worker_evaluate_chunk, chunk, gpu_id)
+                        for chunk, gpu_id in active_assignments
+                    ]
+
+                    # Thread-Safe Aggregation: gather results sequentially as workers complete
+                    for fut in concurrent.futures.as_completed(futures):
+                        chunk_results = fut.result()
+
+                        # Record results and update CSV
+                        buffer_rows = []
+                        for res in chunk_results:
+                            res["Epoch"] = epoch
+                            buffer_rows.append(res)
+                            evaluated_cache[param_key(res)] = res
+                            completed_in_epoch += 1
+                            epoch_eval_count += 1
+
+                            acc = res["Overall_Accuracy"]
+                            tp  = res["TP"]
+                            fp  = res["FP"]
+
+                            if (acc > best_acc_so_far) or (acc == best_acc_so_far and tp > best_tp_so_far) or (acc == best_acc_so_far and tp == best_tp_so_far and fp < best_fp_so_far):
+                                best_acc_so_far    = acc
+                                best_tp_so_far     = tp
+                                best_fp_so_far     = fp
+                                best_cid_so_far    = res["Combo_ID"]
+                                best_params_so_far = {k: res[k] for k in ALL_PARAM_KEYS}
+                                improved_this_epoch = True
+
+                        if buffer_rows:
+                            df_chunk = pd.DataFrame(buffer_rows)
+                            write_header = not os.path.exists(final_accuracy_csv)
+                            df_chunk.to_csv(final_accuracy_csv, mode='a', header=write_header, index=False)
+
+                        # Telemetry calculations
+                        elapsed_total = time.perf_counter() - t_opt_start
+                        elapsed_eval = time.perf_counter() - epoch_eval_start
+                        combos_sec = epoch_eval_count / elapsed_eval if elapsed_eval > 0 else 0.0
+                        eff_fps = combos_sec * total_cached_frames
+
+                        remaining_combos_epoch = total_epoch_combos - completed_in_epoch
+                        eta_sec = remaining_combos_epoch / combos_sec if combos_sec > 0 else 0.0
+
+                        progress.update(
+                            task_id,
+                            completed=completed_in_epoch,
+                            speed=f"{combos_sec:.1f} c/s | {eff_fps:,.0f} FPS ({len(active_assignments)} GPUs)",
+                            best=f"Best: {best_acc_so_far:.2f}% (#{best_cid_so_far})"
                         )
-                    except torch.cuda.OutOfMemoryError:
-                        console.print("[bold red]OOM encountered. Retrying in halves...[/bold red]")
-                        batch_results = []
-                        half = max(1, len(combo_batch) // 2)
-                        for s_start in range(0, len(combo_batch), half):
-                            sub = combo_batch[s_start:s_start + half]
-                            torch.cuda.empty_cache()
-                            sub_res = evaluate_combo_batch_gpu(
-                                sub, gpu_videos, ref_embs_t, target_names,
-                                y_real, roll_names, true_dict, short_to_roll, device
-                            )
-                            batch_results.extend(sub_res)
 
-                    b_t1 = time.perf_counter()
+                        write_live_progress(
+                            SWEEP_OUTPUT_DIR, main_pid, epoch, MAX_EPOCHS,
+                            completed_in_epoch, total_epoch_combos, len(evaluated_cache),
+                            combos_sec, eff_fps, elapsed_total, eta_sec,
+                            best_acc_so_far, best_cid_so_far, best_params_so_far
+                        )
 
-                    # Record results and update CSV
-                    buffer_rows = []
-                    for res in batch_results:
-                        res["Epoch"] = epoch
-                        buffer_rows.append(res)
-                        evaluated_cache[param_key(res)] = res
-                        completed_in_epoch += 1
-                        epoch_eval_count += 1
+            # Update center point theta* to the best combination found
+            if best_params_so_far is not None:
+                theta_star = dict(best_params_so_far)
 
-                        acc = res["Overall_Accuracy"]
-                        tp  = res["TP"]
-                        fp  = res["FP"]
+            # Step size decay: Delta <- 0.5 * Delta
+            for k, cfg in ACTIVE_VARS.items():
+                if cfg["is_int"]:
+                    current_steps[k] = max(1, int(round(current_steps[k] * 0.5)))
+                else:
+                    current_steps[k] = max(0.01, round(current_steps[k] * 0.5, 4))
 
-                        if (acc > best_acc_so_far) or (acc == best_acc_so_far and tp > best_tp_so_far) or (acc == best_acc_so_far and tp == best_tp_so_far and fp < best_fp_so_far):
-                            best_acc_so_far    = acc
-                            best_tp_so_far     = tp
-                            best_fp_so_far     = fp
-                            best_cid_so_far    = res["Combo_ID"]
-                            best_params_so_far = {k: res[k] for k in ALL_PARAM_KEYS}
-                            improved_this_epoch = True
-
-                    df_chunk = pd.DataFrame(buffer_rows)
-                    write_header = not os.path.exists(final_accuracy_csv)
-                    df_chunk.to_csv(final_accuracy_csv, mode='a', header=write_header, index=False)
-
-                    # Telemetry calculations
-                    elapsed_total = time.perf_counter() - t_opt_start
-                    elapsed_batch = b_t1 - b_t0
-                    combos_sec = len(combo_batch) / elapsed_batch if elapsed_batch > 0 else 0.0
-                    eff_fps = combos_sec * total_cached_frames
-                    vids_sec = combos_sec * len(gpu_videos)
-
-                    remaining_combos_epoch = total_epoch_combos - completed_in_epoch
-                    eta_sec = remaining_combos_epoch / combos_sec if combos_sec > 0 else 0.0
-
-                    progress.update(
-                        task_id,
-                        completed=completed_in_epoch,
-                        speed=f"{combos_sec:.1f} c/s | {eff_fps:,.0f} FPS",
-                        best=f"Best: {best_acc_so_far:.2f}% (#{best_cid_so_far})"
-                    )
-
-                    write_live_progress(
-                        SWEEP_OUTPUT_DIR, main_pid, epoch, MAX_EPOCHS,
-                        completed_in_epoch, total_epoch_combos, len(evaluated_cache),
-                        combos_sec, eff_fps, elapsed_total, eta_sec,
-                        best_acc_so_far, best_cid_so_far, best_params_so_far
-                    )
-
-        # Update center point theta* to the best combination found
-        if best_params_so_far is not None:
-            theta_star = dict(best_params_so_far)
-
-        # Step size decay: Delta <- 0.5 * Delta
-        for k, cfg in ACTIVE_VARS.items():
-            if cfg["is_int"]:
-                current_steps[k] = max(1, int(round(current_steps[k] * 0.5)))
-            else:
-                current_steps[k] = max(0.01, round(current_steps[k] * 0.5, 4))
-
-        # Check early stopping convergence
-        all_at_minimum = all(
-            (current_steps[k] <= 1 if cfg["is_int"] else current_steps[k] <= 0.01)
-            for k, cfg in ACTIVE_VARS.items()
-        )
-        if all_at_minimum and not improved_this_epoch:
-            console.print("[bold green]Local convergence reached at minimum step precision. Finishing optimizer early.[/bold green]")
-            break
+            # Check early stopping convergence
+            all_at_minimum = all(
+                (current_steps[k] <= 1 if cfg["is_int"] else current_steps[k] <= 0.01)
+                for k, cfg in ACTIVE_VARS.items()
+            )
+            if all_at_minimum and not improved_this_epoch:
+                console.print("[bold green]Local convergence reached at minimum step precision. Finishing optimizer early.[/bold green]")
+                break
 
     # 6. Generate Final Visualization & Rich Leaderboard Report
     console.print("\n[bold yellow]Generating final report and visualization...[/bold yellow]")
