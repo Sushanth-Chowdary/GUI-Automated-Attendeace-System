@@ -105,7 +105,7 @@ ALL_PARAM_KEYS = [
     "MIN_WIN_RATIO",
 ]
 
-MAX_EPOCHS = 6
+MAX_EPOCHS = 10
 BASE_MIN_BOX_SIZE = 45.0  
 FRAME_SKIP = 1
 MAX_STAGE1_WORKERS = 4
@@ -1114,24 +1114,12 @@ def evaluate_combo_batch_gpu(
 # ==========================================
 # MULTI-GPU STAGE 2 WORKER EVALUATION POOL
 # ==========================================
-_STAGE2_WORKER_DATA = {}
-_STAGE2_GPU_CACHE   = {}
-
-
-def init_stage2_sweep_worker(cpu_videos, ref_embs_cpu, target_names, y_real, roll_names, true_dict, short_to_roll):
-    """
-    Worker initializer: receives shared CPU tensors and reference data once per worker process.
-    """
-    global _STAGE2_WORKER_DATA
-    _STAGE2_WORKER_DATA = {
-        'cpu_videos': cpu_videos,
-        'ref_embs_cpu': ref_embs_cpu,
-        'target_names': target_names,
-        'y_real': y_real,
-        'roll_names': roll_names,
-        'true_dict': true_dict,
-        'short_to_roll': short_to_roll,
-    }
+GPU_DATA_CACHE = {}
+target_names   = None
+y_real         = None
+roll_names     = None
+true_dict      = None
+short_to_roll  = None
 
 
 def chunk_combinations(items, num_chunks):
@@ -1154,39 +1142,12 @@ def worker_evaluate_chunk(chunk, gpu_id):
     """
     Worker wrapper function that takes its assigned chunk of combinations and its assigned gpu_id,
     sets device = torch.device(f'cuda:{gpu_id}'), and runs the batched evaluation
-    (evaluate_combo_batch_gpu) exclusively on that GPU.
+    (evaluate_combo_batch_gpu) exclusively on that GPU using pre-staged GPU_DATA_CACHE.
     """
-    global _STAGE2_WORKER_DATA, _STAGE2_GPU_CACHE
-
     device = torch.device(f'cuda:{gpu_id}')
     torch.cuda.set_device(device)
 
-    # Transfer shared CPU tensors to this worker's GPU once and cache in VRAM
-    if gpu_id not in _STAGE2_GPU_CACHE:
-        c_videos     = _STAGE2_WORKER_DATA['cpu_videos']
-        c_ref        = _STAGE2_WORKER_DATA['ref_embs_cpu']
-        ref_embs_t   = c_ref.to(device, non_blocking=True).t().contiguous()
-        gpu_videos   = []
-        for v in c_videos:
-            gpu_tracks = []
-            for td in v['tracks']:
-                gpu_tracks.append({
-                    'frames_alive': td['frames_alive'],
-                    'box_w': td['box_w'].to(device, non_blocking=True),
-                    'box_h': td['box_h'].to(device, non_blocking=True),
-                    'embs' : td['embs'].to(device, non_blocking=True),
-                    'norms': td['norms'].to(device, non_blocking=True),
-                })
-            gpu_videos.append({'date_str': v['date_str'], 'tracks': gpu_tracks})
-        _STAGE2_GPU_CACHE[gpu_id] = (gpu_videos, ref_embs_t)
-    else:
-        gpu_videos, ref_embs_t = _STAGE2_GPU_CACHE[gpu_id]
-
-    target_names  = _STAGE2_WORKER_DATA['target_names']
-    y_real        = _STAGE2_WORKER_DATA['y_real']
-    roll_names    = _STAGE2_WORKER_DATA['roll_names']
-    true_dict     = _STAGE2_WORKER_DATA['true_dict']
-    short_to_roll = _STAGE2_WORKER_DATA['short_to_roll']
+    gpu_videos, ref_embs_t = GPU_DATA_CACHE[gpu_id]
 
     num_batches = (len(chunk) + GPU_BATCH_SIZE - 1) // GPU_BATCH_SIZE
     chunk_results = []
@@ -1377,11 +1338,15 @@ if __name__ == '__main__':
         console.print(f"[bold cyan]Discovered {len(target_videos)} videos in '{INPUT_VIDEOS_DIR}'.[/bold cyan]\n")
     except FileNotFoundError:
         console.print(f"[bold yellow]'{INPUT_VIDEOS_DIR}' not found. Falling back to feature cache: '{FEATURE_CACHE_DIR}'...[/bold yellow]")
-        target_videos = sorted([
-            (f[:-len('_features.pt')] + '.mp4')
-            for f in os.listdir(FEATURE_CACHE_DIR)
-            if f.endswith('_features.pt') and not f.startswith('.')
-        ])
+        fallback_videos = []
+        for f in os.listdir(FEATURE_CACHE_DIR):
+            if f.startswith('.'):
+                continue
+            if f.endswith('_raw_features.pt'):
+                fallback_videos.append(f[:-len('_raw_features.pt')] + '.mp4')
+            elif f.endswith('_features.pt'):
+                fallback_videos.append(f[:-len('_features.pt')] + '.mp4')
+        target_videos = sorted(list(set(fallback_videos)))
         console.print(f"[bold cyan]Discovered {len(target_videos)} cached pseudo-videos in '{FEATURE_CACHE_DIR}'.[/bold cyan]\n")
 
     if not target_videos:
@@ -1411,6 +1376,33 @@ if __name__ == '__main__':
     if not cpu_videos:
         console.print("[bold red]No valid video caches loaded! Exiting.[/bold red]")
         sys.exit(0)
+
+    num_cached_videos = len(cpu_videos)
+
+    # Pre-stage cached video tensors and gallery directly onto ACTIVE_GPUS
+    console.print(f"\n[bold cyan]Pre-staging cached video tensors directly onto GPUs {ACTIVE_GPUS}...[/bold cyan]")
+    GPU_DATA_CACHE = {}
+    for gpu_id in ACTIVE_GPUS:
+        dev = torch.device(f"cuda:{gpu_id}")
+        ref_embs_t = ref_embs_cpu.to(dev, non_blocking=True).t().contiguous()
+        gpu_videos = []
+        for v in cpu_videos:
+            gpu_tracks = []
+            for td in v['tracks']:
+                gpu_tracks.append({
+                    'frames_alive': td['frames_alive'],
+                    'box_w': td['box_w'].to(dev, non_blocking=True),
+                    'box_h': td['box_h'].to(dev, non_blocking=True),
+                    'embs' : td['embs'].to(dev, non_blocking=True),
+                    'norms': td['norms'].to(dev, non_blocking=True),
+                })
+            gpu_videos.append({'date_str': v['date_str'], 'tracks': gpu_tracks})
+        GPU_DATA_CACHE[gpu_id] = (gpu_videos, ref_embs_t)
+        console.print(f"  [bold green]OK Pre-staged {len(gpu_videos)} videos onto cuda:{gpu_id}[/bold green]")
+
+    del cpu_videos
+    del ref_embs_cpu
+    gc.collect()
 
     # 5. Initialize Progressive Epoch Optimizer
     final_accuracy_csv = os.path.join(SWEEP_OUTPUT_DIR, "sweep_final_accuracy.csv")
@@ -1469,14 +1461,11 @@ if __name__ == '__main__':
 
     console.print(f"\n[bold white]Starting Epoch-Based Coordinate Ascent Optimizer (MAX_EPOCHS={MAX_EPOCHS}):[/bold white]")
     console.print(f"  * Parallel GPUs: {ACTIVE_GPUS}  |  Batch Size: {GPU_BATCH_SIZE} combos/batch per GPU")
-    console.print(f"  * Cached Videos in Memory: {len(cpu_videos)}  ({total_cached_frames:,} total frames)\n")
+    console.print(f"  * Cached Videos in Memory: {num_cached_videos}  ({total_cached_frames:,} total frames)\n")
 
-    # Multi-GPU ProcessPoolExecutor for Stage 2 Hyperparameter Evaluation
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=len(ACTIVE_GPUS),
-        mp_context=ctx,
-        initializer=init_stage2_sweep_worker,
-        initargs=(cpu_videos, ref_embs_cpu, target_names, y_real, roll_names, true_dict, short_to_roll)
+    # Multi-GPU ThreadPoolExecutor for Stage 2 Hyperparameter Evaluation
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(ACTIVE_GPUS)
     ) as executor:
         # Outer Epoch Loop
         for epoch in range(1, MAX_EPOCHS + 1):
