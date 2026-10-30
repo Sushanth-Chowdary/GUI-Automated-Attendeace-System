@@ -109,7 +109,7 @@ MAX_EPOCHS = 10
 BASE_MIN_BOX_SIZE = 45.0  
 FRAME_SKIP = 1
 MAX_STAGE1_WORKERS = 4
-GPU_BATCH_SIZE = 1024
+GPU_BATCH_SIZE = 2048
 ACTIVE_GPUS = [0, 1, 2]
 
 # ==========================================
@@ -137,10 +137,11 @@ os.makedirs(SWEEP_OUTPUT_DIR, exist_ok=True)
 # ==========================================
 # 3. GROUND TRUTH PREPARATION & TELEMETRY
 # ==========================================
-def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir):
+def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir, base_dir=None):
     """
     Extracts ground truth attendance for all unique video dates across all discovered videos.
     Saves true_attendance_all_videos.csv in ATTENDENCE RESULTS/sweep.
+    Also loads protocol_mapping.csv and returns base_to_protocol dictionary.
     """
     os.makedirs(sweep_dir, exist_ok=True)
     subset_true_path = os.path.join(sweep_dir, "true_attendance_all_videos.csv")
@@ -158,6 +159,22 @@ def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir):
         name_map_df['Short_Name'].astype(str).str.strip(),
         name_map_df['Roll_Name'].astype(str).str.strip()
     ))
+
+    # Load protocol_mapping.csv from results_base_dir (fallback to base_dir or BASE_DIR)
+    protocol_path = os.path.join(results_base_dir, "protocol_mapping.csv")
+    if not os.path.exists(protocol_path):
+        protocol_path = os.path.join(base_dir or BASE_DIR, "protocol_mapping.csv")
+
+    base_to_protocol = {}
+    if os.path.exists(protocol_path):
+        proto_df = pd.read_csv(protocol_path).dropna(subset=['Base_Timestamp', 'Protocol_Length'])
+        base_to_protocol = dict(zip(
+            proto_df['Base_Timestamp'].astype(str).str.strip(),
+            proto_df['Protocol_Length'].astype(str).str.strip()
+        ))
+        console.print(f"[bold green]OK Loaded Protocol Mapping:[/bold green] {len(base_to_protocol)} sessions from {protocol_path}")
+    else:
+        console.print(f"[bold yellow]Warning:[/bold yellow] protocol_mapping.csv not found at {protocol_path}")
 
     required_dates = sorted(list({v.split('_')[0] for v in target_videos}))
 
@@ -192,7 +209,7 @@ def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir):
     for col in true_df.columns:
         true_df[col] = true_df[col].astype(str).str.strip()
 
-    return true_df, short_to_roll
+    return true_df, short_to_roll, base_to_protocol
 
 
 def write_live_progress(sweep_dir, pid, epoch, max_epochs, completed_epoch, total_epoch, total_tested,
@@ -799,11 +816,14 @@ def ensure_all_features_cached(target_videos, input_dir, cache_dir, ctx):
 # ==========================================
 # 6. STAGE 2: GPU-ACCELERATED BATCH EVALUATION
 # ==========================================
-def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true_dict, device=None):
+def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true_dict, base_to_protocol=None, device=None):
     """
     Loads FAISS gallery and all valid cached video track tensors into CPU memory.
     Active GPU workers will load/transfer tensors directly to their respective GPU device.
     """
+    if base_to_protocol is None:
+        base_to_protocol = {}
+
     faiss_index_path = os.path.join(base_dir, 'face_attendance_sota_faiss.bin')
     meta_path        = os.path.join(base_dir, 'face_attendance_sota_meta.pkl')
 
@@ -832,7 +852,11 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
     total_cached_frames = 0
 
     for v in target_videos:
-        date_str = v.split('_')[0]
+        parts = v.split('_')
+        date_str = parts[0]
+        base_ts = f"{parts[0]}_{parts[1]}" if len(parts) > 1 else parts[0]
+        protocol = base_to_protocol.get(base_ts, 'Unknown')
+
         stem = os.path.splitext(v)[0]
         cpath = get_cache_path(cache_dir, stem)
         if not (os.path.exists(cpath) and os.path.getsize(cpath) > 1024):
@@ -862,9 +886,15 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
 
         if video_tracks:
             total_cached_frames += max_vid_frame
-            cpu_videos.append({'date_str': date_str, 'tracks': video_tracks})
+            cpu_videos.append({
+                'base_ts': base_ts,
+                'date_str': date_str,
+                'protocol': protocol,
+                'tracks': video_tracks,
+            })
 
-    console.print(f"[bold green]OK Loaded {len(cpu_videos)} video caches into CPU memory ({total_cached_frames:,} total frames)[/bold green]")
+    unique_sessions = len({v['base_ts'] for v in cpu_videos})
+    console.print(f"[bold green]OK Loaded {len(cpu_videos)} video caches across {unique_sessions} sessions into CPU memory ({total_cached_frames:,} total frames)[/bold green]")
     return cpu_videos, ref_embs, target_names, y_real, roll_names, total_cached_frames
 
 
@@ -990,10 +1020,14 @@ def evaluate_combo_batch_gpu(
     device,
 ):
     """
-    Evaluates a batch of parameter combinations across all cached videos on GPU 0.
-    Returns a list of result dictionaries with accuracy and confusion matrix stats.
+    Evaluates a batch of parameter combinations across all cached videos at session/protocol level.
+    Returns a list of result dictionaries with overall accuracy, confusion matrix stats,
+    and per-protocol accuracies (e.g., Acc_5min, Acc_10min, Acc_15min, Acc_20min, Acc_30min).
     """
     B = len(combo_batch)
+    if B == 0:
+        return []
+
     n_classes = len(target_names)
     y_real_t = torch.tensor(y_real, dtype=torch.int64, device=device)
 
@@ -1011,20 +1045,65 @@ def evaluate_combo_batch_gpu(
     b_min_sample_ratio  = _pt("MIN_SAMPLE_RATIO")
     b_min_win_ratio     = _pt("MIN_WIN_RATIO")
 
-    all_dates   = sorted(true_dict.keys())
-    n_dates     = len(all_dates)
-    n_persons   = n_classes
-    date_to_idx = {d: i for i, d in enumerate(all_dates)}
+    # Group by Session (base_ts) instead of Date:
+    # all_sessions is the sorted list of unique base_ts present in gpu_videos whose date_str exists in true_dict
+    all_sessions = sorted(list({
+        vid['base_ts'] for vid in gpu_videos
+        if vid.get('date_str', vid['base_ts'].split('_')[0]) in true_dict
+    }))
+    n_sessions = len(all_sessions)
+    n_persons = n_classes
+    session_to_idx = {s: i for i, s in enumerate(all_sessions)}
 
-    presence = torch.zeros(B, n_dates, n_persons, dtype=torch.bool, device=device)
+    # Session to Protocol mapping from gpu_videos
+    session_protocol = {}
+    for vid in gpu_videos:
+        b_ts = vid['base_ts']
+        if b_ts not in session_protocol:
+            session_protocol[b_ts] = vid.get('protocol', 'Unknown')
+
+    # Define protocols to evaluate in standard order
+    std_protocols = ['5 min', '10 min', '15 min', '20 min', '30 min']
+    unique_active_protocols = sorted(list(set(session_protocol[s] for s in all_sessions if s in session_protocol)))
+    eval_protocols = [p for p in std_protocols if p in unique_active_protocols]
+    for p in unique_active_protocols:
+        if p not in eval_protocols and p != 'Unknown':
+            eval_protocols.append(p)
+    if 'Unknown' in unique_active_protocols and 'Unknown' not in eval_protocols:
+        eval_protocols.append('Unknown')
+    proto_cols = [f"Acc_{p.replace(' ', '')}" for p in eval_protocols]
+
+    if n_sessions == 0:
+        results = []
+        for combo_id, params in combo_batch:
+            res = {
+                "Combo_ID": combo_id,
+                **params,
+                "Overall_Accuracy": 0.0,
+            }
+            for col_name in proto_cols:
+                res[col_name] = 0.0
+            res.update({
+                "Matches": 0,
+                "Total_Valid": 0,
+                "TP": 0,
+                "TN": 0,
+                "FP": 0,
+                "FN": 0,
+            })
+            results.append(res)
+        return results
+
+    # Allocate presence tensor of shape (B, n_sessions, n_persons)
+    presence = torch.zeros(B, n_sessions, n_persons, dtype=torch.bool, device=device)
 
     for vid_info in gpu_videos:
-        date_str = vid_info['date_str']
-        tracks   = vid_info['tracks']
-        d_idx    = date_to_idx.get(date_str, -1)
-        if d_idx < 0:
+        base_ts = vid_info['base_ts']
+        s_idx = session_to_idx.get(base_ts, -1)
+        if s_idx < 0:
             continue
 
+        tracks = vid_info['tracks']
         for td in tracks:
             embs         = td['embs']
             norms        = td['norms']
@@ -1064,49 +1143,81 @@ def evaluate_combo_batch_gpu(
             conf_idx = confirmed.nonzero(as_tuple=True)[0]
             if conf_idx.numel() > 0:
                 cls_idx = best_class_idx[conf_idx]
-                presence[conf_idx, d_idx, cls_idx] = True
+                # Combine cam1 and cam2 of the same base_ts via logical OR
+                presence[conf_idx, s_idx, cls_idx] = True
 
+    # Vectorize Confusion Matrix & Ground Truth Comparison:
+    # Build ground truth boolean masks for each session (date_str = base_ts.split('_')[0])
+    gt_present = torch.zeros((n_sessions, n_persons), dtype=torch.bool, device=device)
+    gt_valid   = torch.zeros((n_sessions, n_persons), dtype=torch.bool, device=device)
+
+    for s_idx, base_ts in enumerate(all_sessions):
+        date_str = base_ts.split('_')[0]
+        date_true_map = true_dict.get(date_str, {})
+        for cls_i, roll_name in enumerate(roll_names):
+            true_val = date_true_map.get(roll_name, '')
+            if true_val in ('unknown', 'nan', 'none', ''):
+                continue
+            gt_valid[s_idx, cls_i] = True
+            if true_val == 'present':
+                gt_present[s_idx, cls_i] = True
+
+    # Vectorized confusion matrix components
+    tp_tensor = presence & gt_present & gt_valid
+    tn_tensor = (~presence) & (~gt_present) & gt_valid
+    fp_tensor = presence & (~gt_present) & gt_valid
+    fn_tensor = (~presence) & gt_present & gt_valid
+    matches_tensor = tp_tensor | tn_tensor
+
+    overall_tp = tp_tensor.sum(dim=(1, 2)).cpu().tolist()
+    overall_tn = tn_tensor.sum(dim=(1, 2)).cpu().tolist()
+    overall_fp = fp_tensor.sum(dim=(1, 2)).cpu().tolist()
+    overall_fn = fn_tensor.sum(dim=(1, 2)).cpu().tolist()
+    overall_matches = matches_tensor.sum(dim=(1, 2)).cpu().tolist()
+    total_valid_overall = int(gt_valid.sum().item())
+
+    # Vectorized protocol-wise accuracy calculation
+    proto_accs = {}
+    for proto in eval_protocols:
+        s_indices = [i for i, s in enumerate(all_sessions) if session_protocol.get(s) == proto]
+        col_name = f"Acc_{proto.replace(' ', '')}"
+        if not s_indices:
+            proto_accs[col_name] = [0.0] * B
+            continue
+
+        s_indices_t = torch.tensor(s_indices, dtype=torch.int64, device=device)
+        proto_gt_valid = gt_valid[s_indices_t, :]
+        proto_total_valid = int(proto_gt_valid.sum().item())
+        if proto_total_valid > 0:
+            proto_matches = matches_tensor[:, s_indices_t, :].sum(dim=(1, 2))
+            accs = (proto_matches.float() / proto_total_valid * 100.0).cpu().tolist()
+            proto_accs[col_name] = [round(a, 4) for a in accs]
+        else:
+            proto_accs[col_name] = [0.0] * B
+
+    # Compile result dictionaries
     results = []
     for b_i, (combo_id, params) in enumerate(combo_batch):
-        tp = fp = tn = fn = 0
-        total_matches = total_valid = 0
+        matches = overall_matches[b_i]
+        overall_acc = (matches / total_valid_overall * 100.0) if total_valid_overall > 0 else 0.0
 
-        for d_idx, date_str in enumerate(all_dates):
-            if date_str not in true_dict:
-                continue
-            date_true_map = true_dict[date_str]
-
-            for cls_i, roll_name in enumerate(roll_names):
-                true_val = date_true_map.get(roll_name, '')
-                if true_val in ('unknown', 'nan', 'none', ''):
-                    continue
-                total_valid += 1
-                is_pres = presence[b_i, d_idx, cls_i].item()
-                est_val = 'present' if is_pres else 'absent'
-                if est_val == true_val:
-                    total_matches += 1
-                    if est_val == 'present':
-                        tp += 1
-                    else:
-                        tn += 1
-                else:
-                    if est_val == 'present':
-                        fp += 1
-                    else:
-                        fn += 1
-
-        overall_acc = (total_matches / total_valid * 100.0) if total_valid > 0 else 0.0
-        results.append({
+        res = {
             "Combo_ID": combo_id,
             **params,
             "Overall_Accuracy": round(overall_acc, 4),
-            "Matches": total_matches,
-            "Total_Valid": total_valid,
-            "TP": tp,
-            "TN": tn,
-            "FP": fp,
-            "FN": fn,
+        }
+        for col_name in proto_cols:
+            res[col_name] = proto_accs[col_name][b_i]
+
+        res.update({
+            "Matches": matches,
+            "Total_Valid": total_valid_overall,
+            "TP": overall_tp[b_i],
+            "TN": overall_tn[b_i],
+            "FP": overall_fp[b_i],
+            "FN": overall_fn[b_i],
         })
+        results.append(res)
 
     return results
 
@@ -1195,6 +1306,10 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
     best_row = df_sorted.iloc[0]
     varied_keys = [k for k in param_keys if k in df.columns and df[k].nunique() > 1]
 
+    proto_cols = [c for c in ["Acc_5min", "Acc_10min", "Acc_15min", "Acc_20min", "Acc_30min"] if c in df.columns]
+    other_proto_cols = [c for c in df.columns if c.startswith("Acc_") and c not in proto_cols]
+    all_proto_cols = proto_cols + other_proto_cols
+
     leader_table = Table(title=f"[bold green]TOP 15 OPTIMAL HYPERPARAMETER COMBINATIONS (OUT OF {len(df):,} TESTED)[/bold green]")
     leader_table.add_column("Rank", justify="center", style="bold yellow")
     leader_table.add_column("Combo ID", justify="center", style="cyan")
@@ -1202,6 +1317,8 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
         short_h = k.replace("_THRESHOLD", "").replace("MIN_", "")
         leader_table.add_column(short_h, justify="right")
     leader_table.add_column("TP / TN / FP / FN", justify="center", style="magenta")
+    for pc in all_proto_cols:
+        leader_table.add_column(pc.replace("Acc_", ""), justify="right", style="cyan")
     leader_table.add_column("Overall Accuracy", justify="right", style="bold green")
 
     for rank, (_, row) in enumerate(df_sorted.head(15).iterrows(), start=1):
@@ -1210,6 +1327,9 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
             val = row[k]
             row_vals.append(f"{int(val)}" if float(val).is_integer() else f"{val:.3f}")
         row_vals.append(f"{int(row['TP'])} / {int(row['TN'])} / {int(row['FP'])} / {int(row['FN'])}")
+        for pc in all_proto_cols:
+            val = row.get(pc)
+            row_vals.append(f"{float(val):.2f}%" if pd.notna(val) else "--")
         row_vals.append(f"{row['Overall_Accuracy']:.2f}%")
         leader_table.add_row(*row_vals)
 
@@ -1217,9 +1337,11 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
     console.print(leader_table)
 
     best_params_str = "\n".join([f"  * [bold cyan]{k}[/bold cyan]: {best_row[k]}" for k in param_keys if k in best_row])
+    proto_breakdown = "  ".join([f"[cyan]{pc.replace('Acc_', '')}:[/cyan] {best_row[pc]:.2f}%" for pc in all_proto_cols if pc in best_row and pd.notna(best_row[pc])])
     console.print(Panel(
         f"[bold green]Max Overall Accuracy Achieved: {best_row['Overall_Accuracy']:.2f}% (Combo #{int(best_row['Combo_ID'])})[/bold green]\n"
-        f"[bold magenta]Confusion Breakdown:[/bold magenta] TP={int(best_row['TP'])}, TN={int(best_row['TN'])}, FP={int(best_row['FP'])}, FN={int(best_row['FN'])}\n\n"
+        + (f"[bold white]Protocol Accuracies:[/bold white] {proto_breakdown}\n" if proto_breakdown else "")
+        + f"[bold magenta]Confusion Breakdown:[/bold magenta] TP={int(best_row['TP'])}, TN={int(best_row['TN'])}, FP={int(best_row['FP'])}, FN={int(best_row['FN'])}\n\n"
         f"[bold white]Optimal Generalization Parameters for test_yolo_sota.py:[/bold white]\n{best_params_str}",
         title="Stage 2 Optimizer Conclusion",
         expand=False
@@ -1354,7 +1476,9 @@ if __name__ == '__main__':
         sys.exit(0)
 
     # 2. Extract or load ground truth for all videos
-    true_df, short_to_roll = prepare_subset_true_attendance(target_videos, RESULTS_BASE_DIR, SWEEP_OUTPUT_DIR)
+    true_df, short_to_roll, base_to_protocol = prepare_subset_true_attendance(
+        target_videos, RESULTS_BASE_DIR, SWEEP_OUTPUT_DIR, BASE_DIR
+    )
     true_dict = {}
     for col in true_df.columns:
         col_clean = str(col).strip()
@@ -1370,7 +1494,7 @@ if __name__ == '__main__':
     # 4. Load all cached video features and FAISS gallery directly into CPU shared memory
     console.print("\n[bold yellow]Loading video caches and gallery into CPU shared memory...[/bold yellow]")
     cpu_videos, ref_embs_cpu, target_names, y_real, roll_names, total_cached_frames = _load_gpu_sweep_data(
-        target_videos, FEATURE_CACHE_DIR, BASE_DIR, short_to_roll, true_dict
+        target_videos, FEATURE_CACHE_DIR, BASE_DIR, short_to_roll, true_dict, base_to_protocol
     )
 
     if not cpu_videos:
@@ -1387,6 +1511,9 @@ if __name__ == '__main__':
         ref_embs_t = ref_embs_cpu.to(dev, non_blocking=True).t().contiguous()
         gpu_videos = []
         for v in cpu_videos:
+            base_ts = v['base_ts']
+            date_str = v['date_str']
+            protocol = v['protocol']
             gpu_tracks = []
             for td in v['tracks']:
                 gpu_tracks.append({
@@ -1396,9 +1523,15 @@ if __name__ == '__main__':
                     'embs' : td['embs'].to(dev, non_blocking=True),
                     'norms': td['norms'].to(dev, non_blocking=True),
                 })
-            gpu_videos.append({'date_str': v['date_str'], 'tracks': gpu_tracks})
+            gpu_videos.append({
+                'base_ts': base_ts,
+                'date_str': date_str,
+                'protocol': protocol,
+                'tracks': gpu_tracks,
+            })
         GPU_DATA_CACHE[gpu_id] = (gpu_videos, ref_embs_t)
-        console.print(f"  [bold green]OK Pre-staged {len(gpu_videos)} videos onto cuda:{gpu_id}[/bold green]")
+        unique_sessions = len({v['base_ts'] for v in gpu_videos})
+        console.print(f"  [bold green]OK Pre-staged {len(gpu_videos)} videos across {unique_sessions} sessions onto cuda:{gpu_id}[/bold green]")
 
     del cpu_videos
     del ref_embs_cpu
@@ -1461,7 +1594,8 @@ if __name__ == '__main__':
 
     console.print(f"\n[bold white]Starting Epoch-Based Coordinate Ascent Optimizer (MAX_EPOCHS={MAX_EPOCHS}):[/bold white]")
     console.print(f"  * Parallel GPUs: {ACTIVE_GPUS}  |  Batch Size: {GPU_BATCH_SIZE} combos/batch per GPU")
-    console.print(f"  * Cached Videos in Memory: {num_cached_videos}  ({total_cached_frames:,} total frames)\n")
+    num_sessions = len({v['base_ts'] for v in GPU_DATA_CACHE[ACTIVE_GPUS[0]][0]}) if ACTIVE_GPUS else 0
+    console.print(f"  * Cached Videos in Memory: {num_cached_videos} across {num_sessions} sessions ({total_cached_frames:,} total frames)\n")
 
     # Multi-GPU ThreadPoolExecutor for Stage 2 Hyperparameter Evaluation
     with concurrent.futures.ThreadPoolExecutor(
