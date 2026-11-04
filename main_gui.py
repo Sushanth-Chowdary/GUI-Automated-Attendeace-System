@@ -1,5 +1,24 @@
 import os
 import sys
+
+# Auto-configure display for X11 / Tkinter if running in headless/remote terminal
+if not os.environ.get("DISPLAY"):
+    import glob
+    for _sock in sorted(glob.glob("/tmp/.X11-unix/X*"), reverse=True):
+        _disp = ":" + _sock.split("X")[-1]
+        try:
+            import subprocess
+            if subprocess.run(["xset", "q"], env=dict(os.environ, DISPLAY=_disp), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                os.environ["DISPLAY"] = _disp
+                break
+        except Exception:
+            pass
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":1"
+
+if not os.environ.get("XAUTHORITY") and os.path.exists(f"/run/user/{os.getuid()}/gdm/Xauthority"):
+    os.environ["XAUTHORITY"] = f"/run/user/{os.getuid()}/gdm/Xauthority"
+
 import cv2
 import threading
 import queue
@@ -9,7 +28,7 @@ import requests
 import pandas as pd
 from collections import Counter
 import customtkinter as ctk
-from PIL import Image, ImageTk
+from PIL import Image
 import faiss
 import pickle
 import torch
@@ -50,6 +69,7 @@ FRAMES_PER_VOTE = 5
 
 BASE_OUTPUT_DIR = "VIDEOS"
 RESULTS_DIR = os.path.abspath('ATTENDENCE RESULTS/MINE')
+META_PATH = './face_attendance_meta.pkl'
 
 os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -63,13 +83,9 @@ def format_timestamp(frame_count, fps):
 
 
 # ==========================================
-# MULTIPROCESSING INFERENCE PROCESS (THROTTLED CPU)
+# MULTIPROCESSING INFERENCE PROCESS
 # ==========================================
-def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
-    """
-    Evaluates ML on throttled inbound frames inherently preventing deadlocks.
-    Writes native annotations directly against duplicate outputs maintaining 1-1 strict bounds flawlessly.
-    """
+def inference_worker(inf_queue, ann_queue, cmd_queue, result_queue, timestamp_str, cam_name):
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     use_half = torch.cuda.is_available()
     print(f"[ML PROCESS | {cam_name}] Initializing strictly on {device}...")
@@ -103,16 +119,14 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         else:
             index = None
             
-        meta_path = './face_attendance_meta.pkl'
-        if os.path.exists(meta_path):
-            with open(meta_path, 'rb') as f:
+        if os.path.exists(META_PATH):
+            with open(META_PATH, 'rb') as f:
                 saved_data = pickle.load(f)
             target_names = saved_data['target_names']
             y_real = saved_data['y_real']
         else:
             target_names, y_real = [], []
             
-        to_tensor = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTensor()])
     except Exception as e:
         print(f"[ML PROCESS ERROR | {cam_name}] Failed to load models: {e}")
         return
@@ -140,8 +154,6 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
         try:
             shm = shared_memory.SharedMemory(name=item['shm_name'])
             frame_array = np.ndarray(item['shape'], dtype=item['dtype'], buffer=shm.buf)
-            
-            # Pure GPU Optimization: Immediately move frame tensor native to GPU bounds.
             frame_tensor = torch.from_numpy(frame_array).to(device, non_blocking=True).float()
             
             input_fps = item['fps']
@@ -150,7 +162,6 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
             frame_count += (skipped_frames + 1)
             fps = input_fps if input_fps > 0 else 30
             
-            # Deadlock Elimination: Collect tracking metadata strictly decoupled from UI loop drawing frames globally
             metadata = {'boxes': [], 'ids': [], 'names': []}
             current_active_faces = 0
 
@@ -159,7 +170,6 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                 has_detections = results[0].boxes.id is not None
                 
                 if has_detections:
-                    # Explicitly move the tensors to the GPU to match batch_idx
                     boxes = results[0].boxes.xyxy.to(device) 
                     ids = results[0].boxes.id.to(device).int() 
                     current_active_faces = len(ids)
@@ -198,10 +208,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                             batch_idx = torch.zeros((valid_boxes.size(0), 1), device=device, dtype=valid_boxes.dtype)
                             roi_boxes = torch.cat((batch_idx, valid_boxes), dim=1)
                             
-                            # Standardize to NCHW format
                             frame_tensor_chw = frame_tensor.permute(2, 0, 1).unsqueeze(0)
-                            
-                            # Native GPU Vectorized Extraction and Resize
                             crops = ops.roi_align(frame_tensor_chw, roi_boxes, output_size=(160, 160)).detach()
                             
                             valid_ids_list = valid_ids.cpu().tolist()
@@ -215,10 +222,9 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                         
                         if batch_tensors:
                             with torch.inference_mode():
-                                batch_tensor = torch.cat(batch_tensors, dim=0) # (N, 3, 160, 160)
-                                batch_tensor = batch_tensor[:, [2, 1, 0], :, :] # Swap BGR to RGB natively
+                                batch_tensor = torch.cat(batch_tensors, dim=0)
+                                batch_tensor = batch_tensor[:, [2, 1, 0], :, :]
                                 
-                                # GPU Vectorized Blur Filtering
                                 gray = transforms.functional.rgb_to_grayscale(batch_tensor)
                                 laplacian_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
                                 laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
@@ -254,7 +260,6 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                                             track_identities[t_id] = winner
                                             active_track_memory[t_id]['buffer'] = []
 
-                    # Collect tracking metadata instead of drawing on frames directly
                     boxes_cpu = boxes.cpu().numpy()
                     for i in range(len(ids_list)):
                         t_id = ids_list[i]
@@ -281,7 +286,6 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
                 shm.close()
                 shm.unlink()
 
-        # Enforce highly reliable logic outputs directly to single bound queue strictly avoiding cross queue ID locks!
         try:
             ann_queue.put((metadata['boxes'], metadata['ids'], metadata['names'], skipped_frames, current_active_faces, fps), timeout=0.2)
         except queue.Full:
@@ -290,7 +294,7 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
     # ==========================
     # FINAL ATTENDANCE SECURE DUMP
     # ==========================
-    print(f"[ML PROCESS | {cam_name}] Shutting down natively... Generating Log Checkboxes.")
+    print(f"[ML PROCESS | {cam_name}] Shutting down natively... Generating Attendance Logs.")
     final_mem = {**archived_tracks, **active_track_memory}
     debug_data = []
     student_presence = {name: False for name in target_names}
@@ -329,15 +333,21 @@ def inference_worker(inf_queue, ann_queue, cmd_queue, timestamp_str, cam_name):
     output_data = [{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent', 'Detection Count': student_detection_count[s]} for s in target_names]
     pd.DataFrame(output_data).to_csv(os.path.join(RESULTS_DIR, f"{timestamp_str}_{cam_name}_output.csv"), index=False)
 
+    if result_queue is not None:
+        try:
+            result_queue.put({
+                'cam': cam_name,
+                'presence': student_presence,
+                'counts': student_detection_count
+            }, timeout=1.0)
+        except Exception:
+            pass
+
 
 # ==========================================
-# BACKGROUND OUPUT AND INGESTION THREADS
+# BACKGROUND OUTPUT AND INGESTION THREADS
 # ==========================================
 def rstp_reader(ip, running_event, raw_queue, inf_queue, ann_frame_queue=None, enable_inference=True):
-    """ 
-    Absolute Watchdog. 
-    Implements CPU optimization via Input Throttling caching explicit dropped frames natively. 
-    """
     url = f"rtsp://{USERNAME}:{PASSWORD}@{ip}:554/stream1"
     cap = None
     last_frame_time = time.perf_counter()
@@ -365,7 +375,6 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue, ann_frame_queue=None, e
         skipped_frames = max(0, round(delta / target_interval) - 1)
         last_frame_time = now
         
-        # Raw Writer explicitly gets all original non-throttled data payload dictionaries (Zero-Copy)
         if not raw_queue.full():
             try:
                 shm_raw = shared_memory.SharedMemory(create=True, size=frame.nbytes)
@@ -374,7 +383,6 @@ def rstp_reader(ip, running_event, raw_queue, inf_queue, ann_frame_queue=None, e
                 shm_raw.close()
             except Exception: pass
             
-        # Throttled Dispatch payload dicts evaluating constraints preventing CPU Serialization overload arrays entirely
         if enable_inference:
             if not inf_queue.full() and (ann_frame_queue is None or not ann_frame_queue.full()):
                 try:
@@ -417,7 +425,7 @@ def raw_writer_worker(queue_obj, ui_queue, output_path, running_event, populate_
                     
                 if populate_ui and ui_queue is not None:
                     if not ui_queue.full():
-                        ui_queue.put_nowait((frame.copy(), 0))
+                        ui_queue.put_nowait((frame.copy(), 0, []))
             finally:
                 if shm is not None:
                     shm.close()
@@ -449,10 +457,6 @@ def async_video_writer_worker(writer_queue, output_path, running_event):
     if writer: writer.release()
 
 def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, running_event):
-    """
-    Highly robust generic bounds mapping directly towards duplicating skipped loops.
-    Strictly deadlock-free! 
-    """
     while True:
         try:
             item = ann_queue.get(timeout=0.2)
@@ -474,11 +478,15 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
                     shm.close()
                     shm.unlink()
 
+            recognized_names = []
             for i in range(len(ids)):
                 box = boxes[i]
                 t_id = ids[i]
                 name = names[i]
-                color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
+                is_known = name not in ["Unknown", "Analyzing..."]
+                if is_known:
+                    recognized_names.append(name)
+                color = (0, 255, 0) if is_known else (0, 0, 255)
                 cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
                 cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
@@ -486,7 +494,7 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
                 writer_queue.put_nowait((frame, input_fps, skipped_frames + 1))
                 
             if not ui_queue.full():
-                ui_queue.put_nowait((frame, active_faces))
+                ui_queue.put_nowait((frame, active_faces, recognized_names))
                 
         except queue.Empty:
             if not running_event.is_set() and ann_queue.empty(): break
@@ -494,12 +502,8 @@ def ann_writer_worker(ann_queue, ann_frame_queue, ui_queue, writer_queue, runnin
 
 # ==========================================
 # CONSOLE STREAM REDIRECTOR (THREAD-SAFE)
-
-# ==========================================
-# CONSOLE STREAM REDIRECTOR (THREAD-SAFE)
 # ==========================================
 class ConsoleRedirector:
-    """Redirects stdout/stderr writes to a queue-backed GUI logger while preserving original terminal streams."""
     def __init__(self, log_func, original_stream):
         self.log_func = log_func
         self.original_stream = original_stream
@@ -528,15 +532,17 @@ class ConsoleRedirector:
 class AttendanceApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Real-Time Dual-Camera Attendance AI System | Multiprocess Vision Engine")
-        self.geometry("1450x900")
-        self.minsize(1280, 720)
+        self.title("Vision Sentinel Core | Real-Time Dual-Camera Attendance AI")
+        self.geometry("1680x940")
+        self.minsize(1360, 760)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         
         self.running_event = mp.Event()
         self.selected_protocol = ctk.IntVar(value=1)
         self.view_target = ctk.StringVar(value="Camera 1") 
+        self.search_var = ctk.StringVar(value="")
+        self.search_var.trace_add("write", lambda *args: self.refresh_roster_display(force=True))
         
         self.t_end = 0
         self.sys_fps = 0
@@ -544,6 +550,15 @@ class AttendanceApp(ctk.CTk):
         self.frames_rendered = 0
         self.cam1_active_faces = 0
         self.cam2_active_faces = 0
+        self.session_timestamp = ""
+
+        # Load Student Roster
+        self.all_students = self.load_student_roster()
+        self.live_present_set = set()
+        self.final_presence_map = {}
+        self.final_counts_map = {}
+        self.is_finalized = False
+        self._last_roster_signature = None
 
         # Console logging queue & redirection setup
         self.log_queue = queue.Queue()
@@ -554,35 +569,43 @@ class AttendanceApp(ctk.CTk):
         sys.stderr = ConsoleRedirector(self._enqueue_log, self._orig_stderr)
 
         self.setup_ui()
+        self.refresh_roster_display(force=True)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         self.ptz_cmd_queue = queue.Queue()
         self.ptz_worker_thread = threading.Thread(target=self.ptz_command_worker, daemon=True)
         self.ptz_worker_thread.start()
 
-        # Start log queue consumer
         self.after(50, self.process_log_queue)
         self.log("[SYSTEM] Attendance AI Core initialized successfully.")
-        self.log(f"[SYSTEM] Hardware targets: Camera 1 ({CAMERA_IP_1}), Camera 2 ({CAMERA_IP_2}).")
+        self.log(f"[SYSTEM] Loaded {len(self.all_students)} enrolled students from roster.")
+
+    def load_student_roster(self):
+        if os.path.exists(META_PATH):
+            try:
+                with open(META_PATH, 'rb') as f:
+                    data = pickle.load(f)
+                names = sorted(list(set(data.get('target_names', []))))
+                return names
+            except Exception as e:
+                print(f"[WARNING] Failed to load student roster: {e}")
+        return []
 
     def _enqueue_log(self, text):
         if text:
             self.log_queue.put(text)
 
     def log(self, message):
-        """Helper method to route messages with timestamp to the integrated console log."""
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         formatted = f"[{timestamp}] {message.strip()}\n"
         self._enqueue_log(formatted)
 
     def clear_logs(self):
-        """Clears the console log window."""
         self.log_textbox.configure(state="normal")
         self.log_textbox.delete("1.0", "end")
         self.log_textbox.configure(state="disabled")
 
     def process_log_queue(self):
-        """Polls log_queue and flushes messages to the read-only CTkTextbox."""
         lines = []
         while not self.log_queue.empty():
             try:
@@ -614,7 +637,6 @@ class AttendanceApp(ctk.CTk):
                 pass
         
     def on_closing(self):
-        print("Application shutting down... cleaning up memory and processes.")
         self.stop_tracking()
         if hasattr(self, 'ptz_cmd_queue'):
             self.ptz_cmd_queue.put("QUIT")
@@ -625,42 +647,30 @@ class AttendanceApp(ctk.CTk):
         self.destroy()
 
     def create_card(self, parent, title="", subtitle=None):
-        """Helper to create visually grouped card containers with clean, native styling."""
-        card = ctk.CTkFrame(parent, corner_radius=8)
-        card.pack(fill="x", padx=6, pady=4)
+        card = ctk.CTkFrame(parent, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
+        card.pack(fill="x", padx=4, pady=5)
         
         if title:
             header_frame = ctk.CTkFrame(card, fg_color="transparent")
-            header_frame.pack(fill="x", padx=10, pady=(6, 2))
+            header_frame.pack(fill="x", padx=10, pady=(8, 2))
             
-            lbl = ctk.CTkLabel(
-                header_frame,
-                text=title,
-                font=ctk.CTkFont(size=12, weight="bold")
-            )
+            lbl = ctk.CTkLabel(header_frame, text=title, font=ctk.CTkFont(size=11, weight="bold"))
             lbl.pack(side="left", anchor="w")
             
             if subtitle:
-                sub = ctk.CTkLabel(
-                    card,
-                    text=subtitle,
-                    font=ctk.CTkFont(size=10),
-                    text_color=("gray50", "gray65")
-                )
+                sub = ctk.CTkLabel(card, text=subtitle, font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"))
                 sub.pack(anchor="w", padx=10, pady=(0, 4))
                 
         content_frame = ctk.CTkFrame(card, fg_color="transparent")
-        content_frame.pack(fill="x", padx=10, pady=(2, 6))
+        content_frame.pack(fill="x", padx=10, pady=(2, 8))
         return content_frame
 
     def toggle_all_presets(self, cam_num, select=True):
-        """Quickly select or deselect all presets for a given camera."""
         vars_dict = self.cam1_preset_vars if cam_num == 1 else self.cam2_preset_vars
         for var in vars_dict.values():
             var.set(select)
 
     def on_view_target_change(self, value=None):
-        """Updates active target indicators when segmented button changes."""
         target = self.view_target.get()
         if hasattr(self, 'active_stream_lbl'):
             self.active_stream_lbl.configure(text=target)
@@ -669,13 +679,9 @@ class AttendanceApp(ctk.CTk):
         disp_faces = self.cam1_active_faces if target == "Camera 1" else self.cam2_active_faces
         if hasattr(self, 'faces_lbl'):
             self.faces_lbl.configure(text=f"{disp_faces} Detected")
-        self.log(f"[UI] Active telemetry viewport changed to {target}.")
 
     def update_status_indicators(self):
-        """Updates colored status indicator dots and badges for Cam1, Cam2, and ML Engine."""
         is_running = self.running_event.is_set()
-        
-        # Camera 1 Status
         cam1_on = self.cam1_enable_var.get()
         if is_running and cam1_on:
             self.cam1_status_dot.configure(text="●", text_color="#3fb950")
@@ -687,7 +693,6 @@ class AttendanceApp(ctk.CTk):
             self.cam1_status_dot.configure(text="●", text_color="#f85149")
             self.cam1_status_state.configure(text="Offline", text_color="#f85149")
 
-        # Camera 2 Status
         cam2_on = self.cam2_enable_var.get()
         if is_running and cam2_on:
             self.cam2_status_dot.configure(text="●", text_color="#3fb950")
@@ -699,7 +704,6 @@ class AttendanceApp(ctk.CTk):
             self.cam2_status_dot.configure(text="●", text_color="#f85149")
             self.cam2_status_state.configure(text="Offline", text_color="#f85149")
 
-        # ML Engine Status
         tracking_on = self.global_live_tracking_var.get()
         if is_running:
             if tracking_on:
@@ -713,98 +717,74 @@ class AttendanceApp(ctk.CTk):
             self.ml_status_state.configure(text="Standby", text_color="#8b949e")
 
     def setup_ui(self):
-        # Master Window Layout: Left Sidebar + Right Main Content
-        self.sidebar_frame = ctk.CTkFrame(self, width=380, corner_radius=0)
+        # 3-Column Master Architecture:
+        # Left Sidebar (Controls) | Center Content (HUD + Video + Logs) | Right Sidebar (Live & Final Attendance Roster)
+        self.sidebar_frame = ctk.CTkFrame(self, width=350, corner_radius=0, fg_color=("#eaeef2", "#0d1117"))
         self.sidebar_frame.pack(side="left", fill="y", padx=0, pady=0)
         self.sidebar_frame.pack_propagate(False)
 
+        self.roster_sidebar = ctk.CTkFrame(self, width=360, corner_radius=0, fg_color=("#eaeef2", "#0d1117"))
+        self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0)
+        self.roster_sidebar.pack_propagate(False)
+
         self.main_content_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.main_content_frame.pack(side="right", fill="both", expand=True, padx=12, pady=12)
+        self.main_content_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
 
-        # -------------------------------------------------------------
-        # 1. SIDEBAR: Header & Branding
-        # -------------------------------------------------------------
+        # =============================================================
+        # LEFT SIDEBAR: Controls, PTZ & System
+        # =============================================================
         self.brand_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        self.brand_frame.pack(fill="x", padx=12, pady=(14, 8))
+        self.brand_frame.pack(fill="x", padx=14, pady=(14, 8))
 
-        self.logo_label = ctk.CTkLabel(
-            self.brand_frame,
-            text="VISION SENTINEL CORE",
-            font=ctk.CTkFont(size=18, weight="bold")
-        )
-        self.logo_label.pack(anchor="w")
+        ctk.CTkLabel(self.brand_frame, text="VISION SENTINEL CORE", font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(self.brand_frame, text="Dual-Camera Multiprocess AI Pipeline", font=ctk.CTkFont(size=11), text_color=("gray45", "gray60")).pack(anchor="w")
 
-        self.subtitle_label = ctk.CTkLabel(
-            self.brand_frame,
-            text="Dual-Camera Multiprocess AI Pipeline",
-            font=ctk.CTkFont(size=11),
-            text_color=("gray50", "gray65")
-        )
-        self.subtitle_label.pack(anchor="w")
-
-        # -------------------------------------------------------------
-        # 2. SIDEBAR: Live Status Indicators Card
-        # -------------------------------------------------------------
-        self.status_card = ctk.CTkFrame(self.sidebar_frame, corner_radius=8)
+        # System Status Pill Grid
+        self.status_card = ctk.CTkFrame(self.sidebar_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
         self.status_card.pack(fill="x", padx=10, pady=(0, 6))
 
-        status_header = ctk.CTkFrame(self.status_card, fg_color="transparent")
-        status_header.pack(fill="x", padx=8, pady=(6, 2))
-        ctk.CTkLabel(
-            status_header,
-            text="LIVE SYSTEM STATUS",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=("gray50", "gray65")
-        ).pack(side="left")
-
         status_grid = ctk.CTkFrame(self.status_card, fg_color="transparent")
-        status_grid.pack(fill="x", padx=6, pady=(0, 6))
+        status_grid.pack(fill="x", padx=6, pady=6)
         status_grid.grid_columnconfigure((0, 1, 2), weight=1)
 
-        # Cam 1 Status Indicator
-        cam1_status_box = ctk.CTkFrame(status_grid, corner_radius=6)
-        cam1_status_box.grid(row=0, column=0, padx=2, pady=2, sticky="nsew")
+        cam1_status_box = ctk.CTkFrame(status_grid, corner_radius=6, fg_color="transparent")
+        cam1_status_box.grid(row=0, column=0, padx=2, sticky="nsew")
         cam1_dot_box = ctk.CTkFrame(cam1_status_box, fg_color="transparent")
-        cam1_dot_box.pack(pady=(4, 0))
-        self.cam1_status_dot = ctk.CTkLabel(cam1_dot_box, text="●", font=ctk.CTkFont(size=12), text_color="#f85149")
-        self.cam1_status_dot.pack(side="left", padx=3)
+        cam1_dot_box.pack()
+        self.cam1_status_dot = ctk.CTkLabel(cam1_dot_box, text="●", font=ctk.CTkFont(size=11), text_color="#f85149")
+        self.cam1_status_dot.pack(side="left", padx=2)
         ctk.CTkLabel(cam1_dot_box, text="Cam 1", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
         self.cam1_status_state = ctk.CTkLabel(cam1_status_box, text="Offline", font=ctk.CTkFont(size=10), text_color="#f85149")
-        self.cam1_status_state.pack(pady=(0, 4))
+        self.cam1_status_state.pack()
 
-        # Cam 2 Status Indicator
-        cam2_status_box = ctk.CTkFrame(status_grid, corner_radius=6)
-        cam2_status_box.grid(row=0, column=1, padx=2, pady=2, sticky="nsew")
+        cam2_status_box = ctk.CTkFrame(status_grid, corner_radius=6, fg_color="transparent")
+        cam2_status_box.grid(row=0, column=1, padx=2, sticky="nsew")
         cam2_dot_box = ctk.CTkFrame(cam2_status_box, fg_color="transparent")
-        cam2_dot_box.pack(pady=(4, 0))
-        self.cam2_status_dot = ctk.CTkLabel(cam2_dot_box, text="●", font=ctk.CTkFont(size=12), text_color="#f85149")
-        self.cam2_status_dot.pack(side="left", padx=3)
+        cam2_dot_box.pack()
+        self.cam2_status_dot = ctk.CTkLabel(cam2_dot_box, text="●", font=ctk.CTkFont(size=11), text_color="#f85149")
+        self.cam2_status_dot.pack(side="left", padx=2)
         ctk.CTkLabel(cam2_dot_box, text="Cam 2", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
         self.cam2_status_state = ctk.CTkLabel(cam2_status_box, text="Offline", font=ctk.CTkFont(size=10), text_color="#f85149")
-        self.cam2_status_state.pack(pady=(0, 4))
+        self.cam2_status_state.pack()
 
-        # ML Engine Status Indicator
-        ml_status_box = ctk.CTkFrame(status_grid, corner_radius=6)
-        ml_status_box.grid(row=0, column=2, padx=2, pady=2, sticky="nsew")
+        ml_status_box = ctk.CTkFrame(status_grid, corner_radius=6, fg_color="transparent")
+        ml_status_box.grid(row=0, column=2, padx=2, sticky="nsew")
         ml_dot_box = ctk.CTkFrame(ml_status_box, fg_color="transparent")
-        ml_dot_box.pack(pady=(4, 0))
-        self.ml_status_dot = ctk.CTkLabel(ml_dot_box, text="●", font=ctk.CTkFont(size=12), text_color="#8b949e")
-        self.ml_status_dot.pack(side="left", padx=3)
+        ml_dot_box.pack()
+        self.ml_status_dot = ctk.CTkLabel(ml_dot_box, text="●", font=ctk.CTkFont(size=11), text_color="#8b949e")
+        self.ml_status_dot.pack(side="left", padx=2)
         ctk.CTkLabel(ml_dot_box, text="ML Core", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
         self.ml_status_state = ctk.CTkLabel(ml_status_box, text="Standby", font=ctk.CTkFont(size=10), text_color="#8b949e")
-        self.ml_status_state.pack(pady=(0, 4))
+        self.ml_status_state.pack()
 
-        # -------------------------------------------------------------
-        # 3. SIDEBAR: Tabview
-        # -------------------------------------------------------------
+        # Sidebar Tabs
         self.tabview = ctk.CTkTabview(self.sidebar_frame, corner_radius=8)
-        self.tabview.pack(fill="both", expand=True, padx=8, pady=(2, 6))
+        self.tabview.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
         tab_controls = self.tabview.add("Controls")
         tab_ptz = self.tabview.add("PTZ & Presets")
         tab_system = self.tabview.add("System")
 
-        # Scrollable wrappers inside tabs for responsive heights
         self.controls_scroll = ctk.CTkScrollableFrame(tab_controls, fg_color="transparent")
         self.controls_scroll.pack(fill="both", expand=True)
 
@@ -814,9 +794,8 @@ class AttendanceApp(ctk.CTk):
         self.system_scroll = ctk.CTkScrollableFrame(tab_system, fg_color="transparent")
         self.system_scroll.pack(fill="both", expand=True)
 
-        # --- Tab 1: Controls ---
-        # Card: Active Telemetry Viewport
-        card_viewport = self.create_card(self.controls_scroll, "ACTIVE TELEMETRY VIEW", "Select active camera feed for viewport & telemetry")
+        # Tab 1: Controls
+        card_viewport = self.create_card(self.controls_scroll, "ACTIVE VIEWPORT", "Switch live camera preview")
         self.view_toggle = ctk.CTkSegmentedButton(
             card_viewport,
             values=["Camera 1", "Camera 2"],
@@ -826,79 +805,33 @@ class AttendanceApp(ctk.CTk):
         )
         self.view_toggle.pack(fill="x", pady=4)
 
-        # Card: Camera Feed Setup
-        card_cam_setup = self.create_card(self.controls_scroll, "CAMERA FEED SETUP", "Toggle RTSP ingestion streams for cameras")
+        card_cam_setup = self.create_card(self.controls_scroll, "CAMERA STREAMS", "Enable or disable RTSP feeds")
         self.cam1_enable_var = ctk.BooleanVar(value=True)
-        self.cam1_enable_switch = ctk.CTkSwitch(
-            card_cam_setup,
-            text=f"Enable Camera 1 ({CAMERA_IP_1})",
-            variable=self.cam1_enable_var,
-            font=ctk.CTkFont(size=12),
-            command=self.update_status_indicators
-        )
-        self.cam1_enable_switch.pack(pady=(4, 6), anchor="w")
-
+        ctk.CTkSwitch(card_cam_setup, text=f"Camera 1 ({CAMERA_IP_1})", variable=self.cam1_enable_var, font=ctk.CTkFont(size=12), command=self.update_status_indicators).pack(pady=(4, 6), anchor="w")
         self.cam2_enable_var = ctk.BooleanVar(value=True)
-        self.cam2_enable_switch = ctk.CTkSwitch(
-            card_cam_setup,
-            text=f"Enable Camera 2 ({CAMERA_IP_2})",
-            variable=self.cam2_enable_var,
-            font=ctk.CTkFont(size=12),
-            command=self.update_status_indicators
-        )
-        self.cam2_enable_switch.pack(pady=(0, 4), anchor="w")
+        ctk.CTkSwitch(card_cam_setup, text=f"Camera 2 ({CAMERA_IP_2})", variable=self.cam2_enable_var, font=ctk.CTkFont(size=12), command=self.update_status_indicators).pack(pady=(0, 4), anchor="w")
 
-        # Card: Recognition & Tracking
-        card_ml = self.create_card(self.controls_scroll, "REAL-TIME ML ENGINE", "Facial detection & identity recognition pipeline")
+        card_ml = self.create_card(self.controls_scroll, "AI RECOGNITION ENGINE", "Real-time tracking & attendance matching")
         self.global_live_tracking_var = ctk.BooleanVar(value=True)
-        self.global_live_tracking_switch = ctk.CTkSwitch(
-            card_ml,
-            text="Live Tracking & Face Matching",
-            variable=self.global_live_tracking_var,
-            font=ctk.CTkFont(size=12),
-            command=self.update_status_indicators
-        )
-        self.global_live_tracking_switch.pack(pady=4, anchor="w")
+        ctk.CTkSwitch(card_ml, text="Live Tracking & Face Matching", variable=self.global_live_tracking_var, font=ctk.CTkFont(size=12), command=self.update_status_indicators).pack(pady=4, anchor="w")
 
-        ml_note = ctk.CTkLabel(
-            card_ml,
-            text="When enabled, runs YOLOv8n-Face + InceptionResNetV1 in parallel spawn workers. When disabled, operates in raw recording mode.",
-            font=ctk.CTkFont(size=10),
-            text_color=("gray50", "gray65"),
-            wraplength=320,
-            justify="left"
-        )
-        ml_note.pack(anchor="w", pady=(2, 0))
-
-        # --- Tab 2: PTZ & Presets ---
-        # Card: Execution Protocol (Compact 2-column format)
+        # Tab 2: PTZ & Presets
         card_proto = self.create_card(self.ptz_scroll, "EXECUTION PROTOCOL", "Preset dwell durations (Cam 1 / Cam 2)")
         proto_grid = ctk.CTkFrame(card_proto, fg_color="transparent")
         proto_grid.pack(fill="x")
         proto_grid.grid_columnconfigure((0, 1), weight=1)
 
         for idx, (p, info) in enumerate(PROTOCOLS.items()):
-            r = idx // 2
-            c = idx % 2
+            r, c = divmod(idx, 2)
             rb_text = f"{info['name']} ({info['cam1']}s/{info['cam2']}s)"
-            rb = ctk.CTkRadioButton(
-                proto_grid,
-                text=rb_text,
-                variable=self.selected_protocol,
-                value=p,
-                font=ctk.CTkFont(size=11)
-            )
-            rb.grid(row=r, column=c, pady=3, padx=2, sticky="w")
+            ctk.CTkRadioButton(proto_grid, text=rb_text, variable=self.selected_protocol, value=p, font=ctk.CTkFont(size=11)).grid(row=r, column=c, pady=3, padx=2, sticky="w")
 
-        # Card: Presets Selection (Checkboxes without restrictive fixed width)
-        card_presets = self.create_card(self.ptz_scroll, "CAMERA PRESETS", "Active waypoint presets in tour cycle")
-        
-        # Cam 1 Presets
+        card_presets = self.create_card(self.ptz_scroll, "CAMERA PRESETS", "Active tour waypoints")
         cam1_header = ctk.CTkFrame(card_presets, fg_color="transparent")
         cam1_header.pack(fill="x", pady=(2, 2))
-        ctk.CTkLabel(cam1_header, text="Camera 1 Presets (1-8):", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
-        ctk.CTkButton(cam1_header, text="All", width=36, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(1, True)).pack(side="right", padx=(2, 0))
-        ctk.CTkButton(cam1_header, text="None", width=40, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(1, False)).pack(side="right")
+        ctk.CTkLabel(cam1_header, text="Cam 1 (1-8):", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
+        ctk.CTkButton(cam1_header, text="All", width=34, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(1, True)).pack(side="right", padx=(2, 0))
+        ctk.CTkButton(cam1_header, text="None", width=38, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(1, False)).pack(side="right")
 
         self.preset_frame1 = ctk.CTkFrame(card_presets, fg_color="transparent")
         self.preset_frame1.pack(fill="x", pady=(2, 4))
@@ -907,15 +840,13 @@ class AttendanceApp(ctk.CTk):
         for idx, p in enumerate(CAM1_PRESETS):
             var = ctk.BooleanVar(value=True)
             self.cam1_preset_vars[p] = var
-            cb = ctk.CTkCheckBox(self.preset_frame1, text=f"P{p}", variable=var, font=ctk.CTkFont(size=11))
-            cb.grid(row=idx // 4, column=idx % 4, padx=4, pady=3, sticky="nsew")
+            ctk.CTkCheckBox(self.preset_frame1, text=f"P{p}", variable=var, font=ctk.CTkFont(size=11), width=45).grid(row=idx // 4, column=idx % 4, padx=2, pady=3, sticky="w")
 
-        # Cam 2 Presets
         cam2_header = ctk.CTkFrame(card_presets, fg_color="transparent")
         cam2_header.pack(fill="x", pady=(4, 2))
-        ctk.CTkLabel(cam2_header, text="Camera 2 Presets (1-6):", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
-        ctk.CTkButton(cam2_header, text="All", width=36, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(2, True)).pack(side="right", padx=(2, 0))
-        ctk.CTkButton(cam2_header, text="None", width=40, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(2, False)).pack(side="right")
+        ctk.CTkLabel(cam2_header, text="Cam 2 (1-6):", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
+        ctk.CTkButton(cam2_header, text="All", width=34, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(2, True)).pack(side="right", padx=(2, 0))
+        ctk.CTkButton(cam2_header, text="None", width=38, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(2, False)).pack(side="right")
 
         self.preset_frame2 = ctk.CTkFrame(card_presets, fg_color="transparent")
         self.preset_frame2.pack(fill="x", pady=(2, 4))
@@ -924,55 +855,42 @@ class AttendanceApp(ctk.CTk):
         for idx, p in enumerate(CAM2_PRESETS):
             var = ctk.BooleanVar(value=True)
             self.cam2_preset_vars[p] = var
-            cb = ctk.CTkCheckBox(self.preset_frame2, text=f"P{p}", variable=var, font=ctk.CTkFont(size=11))
-            cb.grid(row=idx // 3, column=idx % 3, padx=4, pady=3, sticky="nsew")
+            ctk.CTkCheckBox(self.preset_frame2, text=f"P{p}", variable=var, font=ctk.CTkFont(size=11), width=45).grid(row=idx // 3, column=idx % 3, padx=2, pady=3, sticky="w")
 
-        # Card: Modernized Manual PTZ Controls (Vertical Stack: D-pad on top, horizontally spanning Lens beneath)
-        card_ptz = self.create_card(self.ptz_scroll, "MANUAL PTZ CONTROLS", "Hold button to move/zoom, release to stop")
-        
-        self.ptz_target_lbl = ctk.CTkLabel(
-            card_ptz,
-            text=f"Directing: {self.view_target.get()}",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=("#1f6aa5", "#58a6ff")
-        )
+        card_ptz = self.create_card(self.ptz_scroll, "MANUAL PTZ", "Hold to move, release to stop")
+        self.ptz_target_lbl = ctk.CTkLabel(card_ptz, text=f"Directing: {self.view_target.get()}", font=ctk.CTkFont(size=11, weight="bold"), text_color="#58a6ff")
         self.ptz_target_lbl.pack(anchor="w", pady=(0, 4))
 
-        # 1. D-Pad Container (Stacked on Top)
-        dpad_container = ctk.CTkFrame(card_ptz, corner_radius=8)
+        dpad_container = ctk.CTkFrame(card_ptz, corner_radius=8, fg_color="transparent")
         dpad_container.pack(fill="x", pady=(0, 6))
         dpad_container.grid_columnconfigure((0, 1, 2), weight=1)
 
-        btn_up = ctk.CTkButton(dpad_container, text="▲", font=ctk.CTkFont(size=15, weight="bold"), corner_radius=6)
-        btn_left = ctk.CTkButton(dpad_container, text="◀", font=ctk.CTkFont(size=15, weight="bold"), corner_radius=6)
-        btn_center = ctk.CTkButton(dpad_container, text="PTZ", font=ctk.CTkFont(size=11, weight="bold"), state="disabled", corner_radius=6)
-        btn_right = ctk.CTkButton(dpad_container, text="▶", font=ctk.CTkFont(size=15, weight="bold"), corner_radius=6)
-        btn_down = ctk.CTkButton(dpad_container, text="▼", font=ctk.CTkFont(size=15, weight="bold"), corner_radius=6)
+        btn_up = ctk.CTkButton(dpad_container, text="▲", height=28, font=ctk.CTkFont(size=14, weight="bold"))
+        btn_left = ctk.CTkButton(dpad_container, text="◀", height=28, font=ctk.CTkFont(size=14, weight="bold"))
+        btn_center = ctk.CTkButton(dpad_container, text="PTZ", height=28, font=ctk.CTkFont(size=10, weight="bold"), state="disabled")
+        btn_right = ctk.CTkButton(dpad_container, text="▶", height=28, font=ctk.CTkFont(size=14, weight="bold"))
+        btn_down = ctk.CTkButton(dpad_container, text="▼", height=28, font=ctk.CTkFont(size=14, weight="bold"))
 
-        btn_up.grid(row=0, column=1, padx=4, pady=3, sticky="nsew")
-        btn_left.grid(row=1, column=0, padx=4, pady=3, sticky="nsew")
-        btn_center.grid(row=1, column=1, padx=4, pady=3, sticky="nsew")
-        btn_right.grid(row=1, column=2, padx=4, pady=3, sticky="nsew")
-        btn_down.grid(row=2, column=1, padx=4, pady=3, sticky="nsew")
+        btn_up.grid(row=0, column=1, padx=3, pady=2, sticky="nsew")
+        btn_left.grid(row=1, column=0, padx=3, pady=2, sticky="nsew")
+        btn_center.grid(row=1, column=1, padx=3, pady=2, sticky="nsew")
+        btn_right.grid(row=1, column=2, padx=3, pady=2, sticky="nsew")
+        btn_down.grid(row=2, column=1, padx=3, pady=2, sticky="nsew")
 
-        # 2. Lens Container (Zoom & Focus - Horizontally Spanning Beneath D-pad)
-        lens_container = ctk.CTkFrame(card_ptz, corner_radius=8)
-        lens_container.pack(fill="x", pady=(0, 4))
+        lens_container = ctk.CTkFrame(card_ptz, corner_radius=8, fg_color="transparent")
+        lens_container.pack(fill="x")
         lens_container.grid_columnconfigure((0, 1), weight=1)
 
-        ctk.CTkLabel(lens_container, text="ZOOM", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray50", "gray65")).grid(row=0, column=0, columnspan=2, pady=(4, 1))
-        btn_zi = ctk.CTkButton(lens_container, text="+ Zoom In", font=ctk.CTkFont(size=11, weight="bold"), corner_radius=6)
-        btn_zo = ctk.CTkButton(lens_container, text="- Zoom Out", font=ctk.CTkFont(size=11, weight="bold"), corner_radius=6)
-        btn_zi.grid(row=1, column=0, padx=4, pady=2, sticky="nsew")
-        btn_zo.grid(row=1, column=1, padx=4, pady=2, sticky="nsew")
+        btn_zi = ctk.CTkButton(lens_container, text="+ Zoom In", height=26, font=ctk.CTkFont(size=11))
+        btn_zo = ctk.CTkButton(lens_container, text="- Zoom Out", height=26, font=ctk.CTkFont(size=11))
+        btn_zi.grid(row=0, column=0, padx=3, pady=2, sticky="nsew")
+        btn_zo.grid(row=0, column=1, padx=3, pady=2, sticky="nsew")
 
-        ctk.CTkLabel(lens_container, text="FOCUS", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray50", "gray65")).grid(row=2, column=0, columnspan=2, pady=(4, 1))
-        btn_fi = ctk.CTkButton(lens_container, text="+ Focus Near", font=ctk.CTkFont(size=11, weight="bold"), corner_radius=6)
-        btn_fo = ctk.CTkButton(lens_container, text="- Focus Far", font=ctk.CTkFont(size=11, weight="bold"), corner_radius=6)
-        btn_fi.grid(row=3, column=0, padx=4, pady=(2, 6), sticky="nsew")
-        btn_fo.grid(row=3, column=1, padx=4, pady=(2, 6), sticky="nsew")
+        btn_fi = ctk.CTkButton(lens_container, text="+ Focus Near", height=26, font=ctk.CTkFont(size=11))
+        btn_fo = ctk.CTkButton(lens_container, text="- Focus Far", height=26, font=ctk.CTkFont(size=11))
+        btn_fi.grid(row=1, column=0, padx=3, pady=2, sticky="nsew")
+        btn_fo.grid(row=1, column=1, padx=3, pady=2, sticky="nsew")
 
-        # Bind button press & release events for smooth continuous PTZ operation
         for btn, cmd, stop_cmd in [
             (btn_up, "up", "ptzstop"), (btn_down, "down", "ptzstop"),
             (btn_left, "left", "ptzstop"), (btn_right, "right", "ptzstop"),
@@ -984,49 +902,21 @@ class AttendanceApp(ctk.CTk):
                     w.bind("<ButtonPress-1>", lambda e, c=cmd: self.manual_ptz(c))
                     w.bind("<ButtonRelease-1>", lambda e, sc=stop_cmd: self.manual_ptz(sc))
 
-        # --- Tab 3: System ---
-        card_sys_net = self.create_card(self.system_scroll, "STREAM & NETWORK SETUP", "Configured IP streams & endpoints")
-        ctk.CTkLabel(card_sys_net, text=f"• Cam 1 IP: {CAMERA_IP_1} (RTSP 554)", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=1)
-        ctk.CTkLabel(card_sys_net, text=f"• Cam 2 IP: {CAMERA_IP_2} (RTSP 554)", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=1)
-        ctk.CTkLabel(card_sys_net, text="• PTZ Protocol: CGI Command API", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=1)
-        ctk.CTkLabel(card_sys_net, text="• Ingestion Auth: HTTP Basic Auth", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=1)
-
-        card_sys_storage = self.create_card(self.system_scroll, "STORAGE & MODEL ASSETS", "Output directories and checkpoint locations")
-        ctk.CTkLabel(card_sys_storage, text=f"• Videos Dir: {BASE_OUTPUT_DIR}/", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=1)
-        ctk.CTkLabel(card_sys_storage, text=f"• Results Dir: {RESULTS_DIR}/", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=1)
-        ctk.CTkLabel(card_sys_storage, text="• FAISS Index: ./face_attendance_faiss.bin", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=1)
-        ctk.CTkLabel(card_sys_storage, text="• Face Detection: yolov8n-face.pt", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=1)
-
-        card_sys_ui = self.create_card(self.system_scroll, "APPEARANCE & CONTROLS", "User interface preferences")
-        ctk.CTkLabel(card_sys_ui, text="Theme Mode:", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", pady=(2, 2))
-        theme_selector = ctk.CTkSegmentedButton(
-            card_sys_ui,
-            values=["Dark", "Light", "System"],
-            font=ctk.CTkFont(size=11),
-            command=lambda mode: ctk.set_appearance_mode(mode.lower())
-        )
+        # Tab 3: System
+        card_sys_ui = self.create_card(self.system_scroll, "INTERFACE PREFERENCES")
+        theme_selector = ctk.CTkSegmentedButton(card_sys_ui, values=["Dark", "Light", "System"], font=ctk.CTkFont(size=11), command=lambda mode: ctk.set_appearance_mode(mode.lower()))
         theme_selector.set("Dark")
-        theme_selector.pack(fill="x", pady=(0, 6))
+        theme_selector.pack(fill="x", pady=4)
 
-        clear_btn_sys = ctk.CTkButton(
-            card_sys_ui,
-            text="Clear Console History",
-            font=ctk.CTkFont(size=11),
-            command=self.clear_logs
-        )
-        clear_btn_sys.pack(fill="x", pady=2)
-
-        # -------------------------------------------------------------
-        # 4. SIDEBAR: Persistent Call-to-Action Buttons
-        # -------------------------------------------------------------
+        # Bottom Call-to-Action Buttons
         self.cta_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
         self.cta_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
 
         self.start_btn = ctk.CTkButton(
             self.cta_frame,
-            text="▶  EXECUTE BOUND LOOP",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            height=44,
+            text="▶  START LIVE TRACKING",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            height=42,
             fg_color="#238636",
             hover_color="#2ea043",
             text_color="#ffffff",
@@ -1037,9 +927,9 @@ class AttendanceApp(ctk.CTk):
 
         self.stop_btn = ctk.CTkButton(
             self.cta_frame,
-            text="■  FORCE STOP SYSTEM",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            height=38,
+            text="■  STOP & FINALIZE ROSTER",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=36,
             fg_color="transparent",
             border_width=2,
             border_color="#da3633",
@@ -1048,110 +938,235 @@ class AttendanceApp(ctk.CTk):
             corner_radius=8,
             command=self.stop_tracking
         )
-        self.stop_btn.pack(fill="x", pady=0)
+        self.stop_btn.pack(fill="x")
         self.stop_btn.configure(state="disabled")
 
-        # -------------------------------------------------------------
-        # 5. RIGHT MAIN: Horizontal Telemetry HUD
-        # -------------------------------------------------------------
+        # =============================================================
+        # CENTER PANEL: Telemetry HUD + Video Feed + Console Logs
+        # =============================================================
         self.hud_frame = ctk.CTkFrame(self.main_content_frame, corner_radius=8, fg_color="transparent")
         self.hud_frame.pack(fill="x", padx=0, pady=(0, 8))
         self.hud_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-        # HUD Tile 0: Remaining Timer
-        tile0 = ctk.CTkFrame(self.hud_frame, corner_radius=6, fg_color=("#1f242d", "#161b22"), border_width=1, border_color=("#30363d", "#30363d"))
-        tile0.grid(row=0, column=0, padx=4, pady=6, sticky="nsew")
-        ctk.CTkLabel(tile0, text="REMAINING TIMER", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray50", "gray65")).pack(pady=(6, 0), padx=8, anchor="w")
-        self.time_lbl = ctk.CTkLabel(tile0, text="00:00:00", font=ctk.CTkFont(size=20, weight="bold"), text_color="#58a6ff")
-        self.time_lbl.pack(pady=(0, 6), padx=8, anchor="w")
+        tile0 = ctk.CTkFrame(self.hud_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
+        tile0.grid(row=0, column=0, padx=(0, 4), pady=2, sticky="nsew")
+        ctk.CTkLabel(tile0, text="REMAINING TIME", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(pady=(6, 0), padx=10, anchor="w")
+        self.time_lbl = ctk.CTkLabel(tile0, text="00:00:00", font=ctk.CTkFont(size=19, weight="bold"), text_color="#58a6ff")
+        self.time_lbl.pack(pady=(0, 6), padx=10, anchor="w")
 
-        # HUD Tile 1: Render Speed
-        tile1 = ctk.CTkFrame(self.hud_frame, corner_radius=6, fg_color=("#1f242d", "#161b22"), border_width=1, border_color=("#30363d", "#30363d"))
-        tile1.grid(row=0, column=1, padx=4, pady=6, sticky="nsew")
-        ctk.CTkLabel(tile1, text="SYSTEM RENDER FPS", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray50", "gray65")).pack(pady=(6, 0), padx=8, anchor="w")
-        self.fps_lbl = ctk.CTkLabel(tile1, text="0.0 FPS", font=ctk.CTkFont(size=20, weight="bold"), text_color="#3fb950")
-        self.fps_lbl.pack(pady=(0, 6), padx=8, anchor="w")
+        tile1 = ctk.CTkFrame(self.hud_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
+        tile1.grid(row=0, column=1, padx=4, pady=2, sticky="nsew")
+        ctk.CTkLabel(tile1, text="RENDER SPEED", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(pady=(6, 0), padx=10, anchor="w")
+        self.fps_lbl = ctk.CTkLabel(tile1, text="0.0 FPS", font=ctk.CTkFont(size=19, weight="bold"), text_color="#3fb950")
+        self.fps_lbl.pack(pady=(0, 6), padx=10, anchor="w")
 
-        # HUD Tile 2: Target Faces
-        tile2 = ctk.CTkFrame(self.hud_frame, corner_radius=6, fg_color=("#1f242d", "#161b22"), border_width=1, border_color=("#30363d", "#30363d"))
-        tile2.grid(row=0, column=2, padx=4, pady=6, sticky="nsew")
-        ctk.CTkLabel(tile2, text="TARGET FACES DETECTED", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray50", "gray65")).pack(pady=(6, 0), padx=8, anchor="w")
-        self.faces_lbl = ctk.CTkLabel(tile2, text="0 Detected", font=ctk.CTkFont(size=20, weight="bold"), text_color="#d29922")
-        self.faces_lbl.pack(pady=(0, 6), padx=8, anchor="w")
+        tile2 = ctk.CTkFrame(self.hud_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
+        tile2.grid(row=0, column=2, padx=4, pady=2, sticky="nsew")
+        ctk.CTkLabel(tile2, text="ACTIVE FACES IN VIEW", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(pady=(6, 0), padx=10, anchor="w")
+        self.faces_lbl = ctk.CTkLabel(tile2, text="0 Detected", font=ctk.CTkFont(size=19, weight="bold"), text_color="#d29922")
+        self.faces_lbl.pack(pady=(0, 6), padx=10, anchor="w")
 
-        # HUD Tile 3: Active Viewport
-        tile3 = ctk.CTkFrame(self.hud_frame, corner_radius=6, fg_color=("#1f242d", "#161b22"), border_width=1, border_color=("#30363d", "#30363d"))
-        tile3.grid(row=0, column=3, padx=4, pady=6, sticky="nsew")
-        ctk.CTkLabel(tile3, text="ACTIVE VIEWPORT", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray50", "gray65")).pack(pady=(6, 0), padx=8, anchor="w")
-        self.active_stream_lbl = ctk.CTkLabel(tile3, text="Camera 1", font=ctk.CTkFont(size=18, weight="bold"), text_color="#bc8cff")
-        self.active_stream_lbl.pack(pady=(0, 6), padx=8, anchor="w")
+        tile3 = ctk.CTkFrame(self.hud_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
+        tile3.grid(row=0, column=3, padx=(4, 0), pady=2, sticky="nsew")
+        ctk.CTkLabel(tile3, text="ACTIVE CAMERA", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(pady=(6, 0), padx=10, anchor="w")
+        self.active_stream_lbl = ctk.CTkLabel(tile3, text="Camera 1", font=ctk.CTkFont(size=19, weight="bold"), text_color="#bc8cff")
+        self.active_stream_lbl.pack(pady=(0, 6), padx=10, anchor="w")
 
-        # -------------------------------------------------------------
-        # 6. RIGHT MAIN: Main Video Viewport (Cinematic Black Container)
-        # -------------------------------------------------------------
-        self.video_container = ctk.CTkFrame(self.main_content_frame, corner_radius=8, fg_color="black")
+        # Video Viewport
+        self.video_container = ctk.CTkFrame(self.main_content_frame, corner_radius=8, fg_color="#000000", border_width=1, border_color=("#d0d7de", "#30363d"))
         self.video_container.pack(fill="both", expand=True, padx=0, pady=(0, 8))
 
         self.video_frame = ctk.CTkLabel(
             self.video_container,
-            text="Camera Feed Standby\n\nClick 'Execute Bound Loop' to start ingestion and AI pipeline",
-            font=ctk.CTkFont(size=15, weight="bold"),
+            text="Camera Feed Standby\n\nClick 'Start Live Tracking' to begin classroom attendance monitoring",
+            font=ctk.CTkFont(size=14, weight="bold"),
             text_color=("gray50", "gray65"),
             fg_color="black"
         )
-        self.video_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        self.video_frame.pack(fill="both", expand=True, padx=2, pady=2)
 
-        # -------------------------------------------------------------
-        # 7. RIGHT MAIN: Integrated Console Logs
-        # -------------------------------------------------------------
-        self.log_container = ctk.CTkFrame(self.main_content_frame, corner_radius=8, height=140)
+        # Bottom Console Logs
+        self.log_container = ctk.CTkFrame(self.main_content_frame, corner_radius=8, height=130, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
         self.log_container.pack(fill="x", padx=0, pady=0)
         self.log_container.pack_propagate(False)
 
         log_header = ctk.CTkFrame(self.log_container, fg_color="transparent")
-        log_header.pack(fill="x", padx=10, pady=(6, 4))
+        log_header.pack(fill="x", padx=10, pady=(5, 2))
+        ctk.CTkLabel(log_header, text="SYSTEM PIPELINE CONSOLE", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(side="left")
+        ctk.CTkButton(log_header, text="Clear", width=55, height=20, font=ctk.CTkFont(size=10), command=self.clear_logs).pack(side="right", padx=(6, 0))
+        ctk.CTkCheckBox(log_header, text="Auto-scroll", variable=self.autoscroll_var, font=ctk.CTkFont(size=10), checkbox_width=14, checkbox_height=14).pack(side="right", padx=6)
 
-        log_title = ctk.CTkLabel(
-            log_header,
-            text="INTEGRATED SYSTEM CONSOLE & PIPELINE LOGS",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=("gray50", "gray65")
-        )
-        log_title.pack(side="left")
-
-        clear_btn = ctk.CTkButton(
-            log_header,
-            text="Clear Logs",
-            width=70,
-            height=22,
-            font=ctk.CTkFont(size=10, weight="bold"),
-            corner_radius=4,
-            command=self.clear_logs
-        )
-        clear_btn.pack(side="right", padx=(6, 0))
-
-        autoscroll_cb = ctk.CTkCheckBox(
-            log_header,
-            text="Auto-scroll",
-            variable=self.autoscroll_var,
-            font=ctk.CTkFont(size=11),
-            checkbox_width=16,
-            checkbox_height=16,
-            corner_radius=4
-        )
-        autoscroll_cb.pack(side="right", padx=6)
-
-        self.log_textbox = ctk.CTkTextbox(
-            self.log_container,
-            font=ctk.CTkFont(size=11),
-            wrap="word",
-            corner_radius=6
-        )
-        self.log_textbox.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self.log_textbox = ctk.CTkTextbox(self.log_container, font=ctk.CTkFont(size=11), wrap="word", corner_radius=6)
+        self.log_textbox.pack(fill="both", expand=True, padx=8, pady=(0, 6))
         self.log_textbox.configure(state="disabled")
 
-        # Initialize status indicators
+        # =============================================================
+        # RIGHT SIDEBAR: CLASS ATTENDANCE ROSTER (ABSENT FIRST, THEN PRESENT)
+        # =============================================================
+        roster_header = ctk.CTkFrame(self.roster_sidebar, fg_color="transparent")
+        roster_header.pack(fill="x", padx=14, pady=(14, 6))
+
+        title_row = ctk.CTkFrame(roster_header, fg_color="transparent")
+        title_row.pack(fill="x")
+        ctk.CTkLabel(title_row, text="CLASS ATTENDANCE", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left")
+
+        self.roster_mode_badge = ctk.CTkLabel(
+            title_row,
+            text="STANDBY",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=("#d0d7de", "#30363d"),
+            text_color=("#24292f", "#c9d1d9"),
+            corner_radius=6,
+            padx=8,
+            pady=2
+        )
+        self.roster_mode_badge.pack(side="right")
+
+        # Summary Counter Banner (Present / Total & Absent Count)
+        self.summary_card = ctk.CTkFrame(self.roster_sidebar, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
+        self.summary_card.pack(fill="x", padx=12, pady=(2, 8))
+
+        count_top = ctk.CTkFrame(self.summary_card, fg_color="transparent")
+        count_top.pack(fill="x", padx=12, pady=(8, 4))
+        ctk.CTkLabel(count_top, text="PRESENT IN CLASS", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(side="left")
+        self.attendance_pct_lbl = ctk.CTkLabel(count_top, text="0.0%", font=ctk.CTkFont(size=11, weight="bold"), text_color="#3fb950")
+        self.attendance_pct_lbl.pack(side="right")
+
+        self.present_Big_lbl = ctk.CTkLabel(
+            self.summary_card,
+            text=f"0 / {len(self.all_students)} Students",
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color="#3fb950"
+        )
+        self.present_Big_lbl.pack(anchor="w", padx=12, pady=(0, 6))
+
+        self.attendance_progress = ctk.CTkProgressBar(self.summary_card, height=8, corner_radius=4, progress_color="#3fb950")
+        self.attendance_progress.pack(fill="x", padx=12, pady=(0, 8))
+        self.attendance_progress.set(0)
+
+        pills_row = ctk.CTkFrame(self.summary_card, fg_color="transparent")
+        pills_row.pack(fill="x", padx=12, pady=(0, 8))
+        pills_row.grid_columnconfigure((0, 1), weight=1)
+
+        abs_pill = ctk.CTkFrame(pills_row, corner_radius=6, fg_color=("#ffebe9", "#2d1519"), border_width=1, border_color="#f85149")
+        abs_pill.grid(row=0, column=0, padx=(0, 4), sticky="nsew")
+        self.absent_count_lbl = ctk.CTkLabel(abs_pill, text=f"Absent: {len(self.all_students)}", font=ctk.CTkFont(size=11, weight="bold"), text_color="#f85149")
+        self.absent_count_lbl.pack(pady=4)
+
+        pres_pill = ctk.CTkFrame(pills_row, corner_radius=6, fg_color=("#dafbe1", "#12261e"), border_width=1, border_color="#3fb950")
+        pres_pill.grid(row=0, column=1, padx=(4, 0), sticky="nsew")
+        self.present_count_lbl = ctk.CTkLabel(pres_pill, text="Present: 0", font=ctk.CTkFont(size=11, weight="bold"), text_color="#3fb950")
+        self.present_count_lbl.pack(pady=4)
+
+        # Search Filter
+        search_frame = ctk.CTkFrame(self.roster_sidebar, fg_color="transparent")
+        search_frame.pack(fill="x", padx=12, pady=(0, 6))
+        self.search_entry = ctk.CTkEntry(
+            search_frame,
+            placeholder_text="Search student name...",
+            textvariable=self.search_var,
+            height=30,
+            font=ctk.CTkFont(size=12)
+        )
+        self.search_entry.pack(fill="x")
+
+        # Unified Scrollable List: ABSENT FIRST, then PRESENT
+        self.roster_scroll = ctk.CTkScrollableFrame(
+            self.roster_sidebar,
+            corner_radius=8,
+            fg_color=("#f6f8fa", "#161b22"),
+            border_width=1,
+            border_color=("#d0d7de", "#30363d")
+        )
+        self.roster_scroll.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
         self.update_status_indicators()
+
+    def refresh_roster_display(self, force=False):
+        """
+        Renders the Attendance Sidebar with ALL ABSENT students first,
+        followed by ALL PRESENT students, and updates total class counts.
+        """
+        if not self.all_students:
+            self.all_students = self.load_student_roster()
+
+        if self.is_finalized and self.final_presence_map:
+            present_set = {name for name, is_pres in self.final_presence_map.items() if is_pres}
+        else:
+            present_set = set(self.live_present_set)
+
+        query = self.search_var.get().strip().lower()
+        signature = (frozenset(present_set), self.is_finalized, query, len(self.all_students))
+        if not force and signature == self._last_roster_signature:
+            return
+        self._last_roster_signature = signature
+
+        total_count = len(self.all_students)
+        present_all = sorted([s for s in self.all_students if s in present_set])
+        absent_all = sorted([s for s in self.all_students if s not in present_set])
+
+        present_count = len(present_all)
+        absent_count = len(absent_all)
+        pct = (present_count / total_count * 100.0) if total_count > 0 else 0.0
+
+        # Update Top Summary Card
+        self.present_Big_lbl.configure(text=f"{present_count} / {total_count} Students")
+        self.attendance_pct_lbl.configure(text=f"{pct:.1f}%")
+        self.attendance_progress.set(present_count / total_count if total_count > 0 else 0.0)
+        self.absent_count_lbl.configure(text=f"Absent: {absent_count}")
+        self.present_count_lbl.configure(text=f"Present: {present_count}")
+
+        # Filter by search query if typed
+        absent_filtered = [s for s in absent_all if query in s.lower()] if query else absent_all
+        present_filtered = [s for s in present_all if query in s.lower()] if query else present_all
+
+        # Clear existing items
+        for child in self.roster_scroll.winfo_children():
+            child.destroy()
+
+        # 1. ABSENT SECTION HEADER (Shown First)
+        abs_header = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color=("#ffebe9", "#2d1519"))
+        abs_header.pack(fill="x", padx=2, pady=(2, 4))
+        ctk.CTkLabel(
+            abs_header,
+            text=f"ABSENT ({len(absent_filtered)})",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#f85149"
+        ).pack(side="left", padx=8, pady=4)
+
+        if absent_filtered:
+            for idx, name in enumerate(absent_filtered, 1):
+                row = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color="transparent")
+                row.pack(fill="x", padx=2, pady=1)
+                ctk.CTkLabel(row, text="●", font=ctk.CTkFont(size=10), text_color="#f85149").pack(side="left", padx=(6, 4))
+                ctk.CTkLabel(row, text=f"{idx}. {name}", font=ctk.CTkFont(size=12), anchor="w").pack(side="left", fill="x", expand=True)
+                ctk.CTkLabel(row, text="ABSENT", font=ctk.CTkFont(size=9, weight="bold"), text_color="#f85149").pack(side="right", padx=6)
+        else:
+            ctk.CTkLabel(self.roster_scroll, text="No absent students!", font=ctk.CTkFont(size=11), text_color=("gray45", "gray60")).pack(pady=6)
+
+        # 2. PRESENT SECTION HEADER (Shown Second)
+        pres_header = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color=("#dafbe1", "#12261e"))
+        pres_header.pack(fill="x", padx=2, pady=(10, 4))
+        ctk.CTkLabel(
+            pres_header,
+            text=f"PRESENT ({len(present_filtered)})",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#3fb950"
+        ).pack(side="left", padx=8, pady=4)
+
+        if present_filtered:
+            for idx, name in enumerate(present_filtered, 1):
+                row = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color="transparent")
+                row.pack(fill="x", padx=2, pady=1)
+                ctk.CTkLabel(row, text="●", font=ctk.CTkFont(size=10), text_color="#3fb950").pack(side="left", padx=(6, 4))
+                ctk.CTkLabel(row, text=f"{idx}. {name}", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(side="left", fill="x", expand=True)
+                
+                badge_text = "VERIFIED" if self.is_finalized else "LIVE"
+                if self.is_finalized and name in self.final_counts_map and self.final_counts_map[name] > 0:
+                    badge_text = f"VERIFIED ({self.final_counts_map[name]})"
+                ctk.CTkLabel(row, text=badge_text, font=ctk.CTkFont(size=9, weight="bold"), text_color="#3fb950").pack(side="right", padx=6)
+        else:
+            ctk.CTkLabel(self.roster_scroll, text="No students marked present yet", font=ctk.CTkFont(size=11), text_color=("gray45", "gray60")).pack(pady=6)
 
     def start_tracking(self):
         if self.running_event.is_set(): return
@@ -1160,6 +1175,15 @@ class AttendanceApp(ctk.CTk):
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         
+        # Reset live & final roster state for new session
+        self.all_students = self.load_student_roster()
+        self.live_present_set.clear()
+        self.final_presence_map.clear()
+        self.final_counts_map.clear()
+        self.is_finalized = False
+        self.roster_mode_badge.configure(text="LIVE TRACKING", fg_color="#1f6feb", text_color="#ffffff")
+        self.refresh_roster_display(force=True)
+
         sel = self.selected_protocol.get()
         p_info = PROTOCOLS[sel]
 
@@ -1185,8 +1209,9 @@ class AttendanceApp(ctk.CTk):
         total_time_cam2 = len(selected_cam2_presets) * (p_info['cam2'] + 5) if use_cam2 else 0
         self.t_end = time.perf_counter() + max(total_time_cam1, total_time_cam2)
 
-        timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.threads = []
+        self.result_q = mp.Queue()
         
         if use_cam1:
             self.cam1_raw_q = queue.Queue(maxsize=60)
@@ -1199,23 +1224,19 @@ class AttendanceApp(ctk.CTk):
                 self.cam1_ann_frame_q = queue.Queue(maxsize=30)
                 self.cam1_writer_q = queue.Queue(maxsize=150)
             else:
-                self.cam1_inf_q = None
-                self.cam1_ann_q = None
-                self.cam1_cmd_q = None
-                self.cam1_ann_frame_q = None
-                self.cam1_writer_q = None
+                self.cam1_inf_q = self.cam1_ann_q = self.cam1_cmd_q = self.cam1_ann_frame_q = self.cam1_writer_q = None
                 
             self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_1, self.running_event, self.cam1_raw_q, self.cam1_inf_q, self.cam1_ann_frame_q, mode1)))
             self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_1, selected_cam1_presets, p_info['cam1'])))
             
             if mode1:
-                self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, timestamp_str, "Cam1"))
+                self.ml_p1 = mp.Process(target=inference_worker, args=(self.cam1_inf_q, self.cam1_ann_q, self.cam1_cmd_q, self.result_q, self.session_timestamp, "Cam1"))
                 self.ml_p1.daemon = True; self.ml_p1.start()
-                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, False)))
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{self.session_timestamp}_cam1_raw.mp4"), self.running_event, False)))
                 self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam1_ann_q, self.cam1_ann_frame_q, self.cam1_ui_q, self.cam1_writer_q, self.running_event)))
-                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam1_writer_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam1_annotated.mp4"), self.running_event)))
+                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam1_writer_q, os.path.join(RESULTS_DIR, f"{self.session_timestamp}_cam1_annotated.mp4"), self.running_event)))
             else:
-                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam1_raw.mp4"), self.running_event, True)))
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam1_raw_q, self.cam1_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{self.session_timestamp}_cam1_raw.mp4"), self.running_event, True)))
 
         if use_cam2:
             self.cam2_raw_q = queue.Queue(maxsize=60)
@@ -1228,23 +1249,19 @@ class AttendanceApp(ctk.CTk):
                 self.cam2_ann_frame_q = queue.Queue(maxsize=30)
                 self.cam2_writer_q = queue.Queue(maxsize=150)
             else:
-                self.cam2_inf_q = None
-                self.cam2_ann_q = None
-                self.cam2_cmd_q = None
-                self.cam2_ann_frame_q = None
-                self.cam2_writer_q = None
+                self.cam2_inf_q = self.cam2_ann_q = self.cam2_cmd_q = self.cam2_ann_frame_q = self.cam2_writer_q = None
                 
             self.threads.append(threading.Thread(target=rstp_reader, args=(CAMERA_IP_2, self.running_event, self.cam2_raw_q, self.cam2_inf_q, self.cam2_ann_frame_q, mode2)))
             self.threads.append(threading.Thread(target=self.ptz_runner, args=(CAMERA_IP_2, selected_cam2_presets, p_info['cam2'])))
             
             if mode2:
-                self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, timestamp_str, "Cam2"))
+                self.ml_p2 = mp.Process(target=inference_worker, args=(self.cam2_inf_q, self.cam2_ann_q, self.cam2_cmd_q, self.result_q, self.session_timestamp, "Cam2"))
                 self.ml_p2.daemon = True; self.ml_p2.start()
-                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, False)))
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, None, os.path.join(BASE_OUTPUT_DIR, f"{self.session_timestamp}_cam2_raw.mp4"), self.running_event, False)))
                 self.threads.append(threading.Thread(target=ann_writer_worker, args=(self.cam2_ann_q, self.cam2_ann_frame_q, self.cam2_ui_q, self.cam2_writer_q, self.running_event)))
-                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam2_writer_q, os.path.join(RESULTS_DIR, f"{timestamp_str}_cam2_annotated.mp4"), self.running_event)))
+                self.threads.append(threading.Thread(target=async_video_writer_worker, args=(self.cam2_writer_q, os.path.join(RESULTS_DIR, f"{self.session_timestamp}_cam2_annotated.mp4"), self.running_event)))
             else:
-                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{timestamp_str}_cam2_raw.mp4"), self.running_event, True)))
+                self.threads.append(threading.Thread(target=raw_writer_worker, args=(self.cam2_raw_q, self.cam2_ui_q, os.path.join(BASE_OUTPUT_DIR, f"{self.session_timestamp}_cam2_raw.mp4"), self.running_event, True)))
 
         for t in self.threads: t.start()
         
@@ -1252,31 +1269,71 @@ class AttendanceApp(ctk.CTk):
         self.frames_rendered = 0
         self.update_gui_frame()
         self.update_status_indicators()
-        self.log(f"[SYSTEM] Bound loop started. Protocol: {p_info['name']}. Session: {timestamp_str}")
+        self.log(f"[SYSTEM] Session {self.session_timestamp} started ({p_info['name']}).")
 
     def stop_tracking(self):
         if not self.running_event.is_set(): return
         self.running_event.clear()
-        self.log("[SYSTEM] Stopping tracking... terminating workers and cleaning shared memory.")
+        self.log("[SYSTEM] Stopping tracking and computing verified attendance...")
         
         if hasattr(self, 'cam1_cmd_q') and self.cam1_cmd_q:
             self.cam1_cmd_q.put('STOP')
         if hasattr(self, 'cam2_cmd_q') and self.cam2_cmd_q:
             self.cam2_cmd_q.put('STOP')
 
-        # Wait for background reader threads to stop generating frames
         if hasattr(self, 'threads'):
             for t in self.threads:
                 if t.is_alive():
                     t.join(timeout=1.0)
 
-        # Wait for ML processes to safely exit
         if hasattr(self, 'ml_p1') and self.ml_p1.is_alive():
-            self.ml_p1.join(timeout=2.0)
+            self.ml_p1.join(timeout=3.0)
         if hasattr(self, 'ml_p2') and self.ml_p2.is_alive():
-            self.ml_p2.join(timeout=2.0)
+            self.ml_p2.join(timeout=3.0)
 
-        # Safely detach and purge pending SharedMemory scopes
+        # Collect final verified attendance from both camera worker processes
+        combined_presence = {s: False for s in self.all_students}
+        combined_counts = {s: 0 for s in self.all_students}
+        received_final = False
+
+        if hasattr(self, 'result_q') and self.result_q:
+            while not self.result_q.empty():
+                try:
+                    res = self.result_q.get_nowait()
+                    received_final = True
+                    for s, is_pres in res.get('presence', {}).items():
+                        if is_pres:
+                            combined_presence[s] = True
+                    for s, cnt in res.get('counts', {}).items():
+                        combined_counts[s] = combined_counts.get(s, 0) + cnt
+                except queue.Empty:
+                    break
+
+        if received_final:
+            self.final_presence_map = combined_presence
+            self.final_counts_map = combined_counts
+            self.is_finalized = True
+            self.roster_mode_badge.configure(text="FINAL VERIFIED", fg_color="#238636", text_color="#ffffff")
+            
+            # Save merged dual-camera attendance sheet
+            merged_rows = [
+                {
+                    'Name': s,
+                    'Status': 'Present' if combined_presence.get(s, False) else 'Absent',
+                    'Total Detections': combined_counts.get(s, 0)
+                }
+                for s in self.all_students
+            ]
+            merged_csv_path = os.path.join(RESULTS_DIR, f"{self.session_timestamp}_COMBINED_output.csv")
+            pd.DataFrame(merged_rows).to_csv(merged_csv_path, index=False)
+            pres_total = sum(1 for v in combined_presence.values() if v)
+            self.log(f"[ROSTER] Final attendance verified: {pres_total}/{len(self.all_students)} Present. Saved to {merged_csv_path}")
+        else:
+            self.roster_mode_badge.configure(text="SESSION ENDED", fg_color="#da3633", text_color="#ffffff")
+
+        self.refresh_roster_display(force=True)
+
+        # Clean up shared memory blocks
         for q_name in ['cam1_inf_q', 'cam2_inf_q', 'cam1_raw_q', 'cam2_raw_q', 'cam1_ann_frame_q', 'cam2_ann_frame_q']:
             if hasattr(self, q_name) and getattr(self, q_name):
                 q = getattr(self, q_name)
@@ -1291,24 +1348,20 @@ class AttendanceApp(ctk.CTk):
                             except Exception: pass
                     except queue.Empty: break
 
-        if hasattr(self, 'cam1_ann_q') and self.cam1_ann_q: self.cam1_ann_q.put(None)
-        if hasattr(self, 'cam2_ann_q') and self.cam2_ann_q: self.cam2_ann_q.put(None)
-        if hasattr(self, 'cam1_writer_q') and self.cam1_writer_q: self.cam1_writer_q.put(None)
-        if hasattr(self, 'cam2_writer_q') and self.cam2_writer_q: self.cam2_writer_q.put(None)
-        if hasattr(self, 'cam1_raw_q') and self.cam1_raw_q: self.cam1_raw_q.put(None)
-        if hasattr(self, 'cam2_raw_q') and self.cam2_raw_q: self.cam2_raw_q.put(None)
+        for q_attr in ['cam1_ann_q', 'cam2_ann_q', 'cam1_writer_q', 'cam2_writer_q', 'cam1_raw_q', 'cam2_raw_q']:
+            if hasattr(self, q_attr) and getattr(self, q_attr):
+                getattr(self, q_attr).put(None)
         
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.update_status_indicators()
-        print("[SYSTEM] System stopped successfully.")
 
     def ptz_runner(self, ip, presets, duration):
         for preset in presets:
             if not self.running_event.is_set(): break
             url = f"http://{ip}/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&{preset}"
             try: requests.get(url, auth=HTTPBasicAuth(USERNAME, PASSWORD), timeout=5)
-            except: pass
+            except Exception: pass
             
             t_mechanical = time.perf_counter()
             while self.running_event.is_set() and (time.perf_counter() - t_mechanical) < 5.0:
@@ -1326,7 +1379,7 @@ class AttendanceApp(ctk.CTk):
 
     def update_gui_frame(self):
         if not self.running_event.is_set():
-            self.video_frame.configure(image=None, text="📷  Camera ML Feed Offline — System Idle")
+            self.video_frame.configure(image=None, text="Camera Feed Offline — Session Completed")
             return
             
         try:
@@ -1341,19 +1394,29 @@ class AttendanceApp(ctk.CTk):
             m, s = divmod(rem, 60)
             self.time_lbl.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
             
+            newly_detected = False
             frame1 = None
             if hasattr(self, 'cam1_ui_q') and self.cam1_ui_q and not self.cam1_ui_q.empty():
                 try: 
-                    res1 = self.cam1_ui_q.get_nowait()
-                    frame1, self.cam1_active_faces = res1
+                    frame1, self.cam1_active_faces, names1 = self.cam1_ui_q.get_nowait()
+                    for n in names1:
+                        if n not in self.live_present_set:
+                            self.live_present_set.add(n)
+                            newly_detected = True
                 except queue.Empty: pass
                     
             frame2 = None
             if hasattr(self, 'cam2_ui_q') and self.cam2_ui_q and not self.cam2_ui_q.empty():
                 try: 
-                    res2 = self.cam2_ui_q.get_nowait()
-                    frame2, self.cam2_active_faces = res2
+                    frame2, self.cam2_active_faces, names2 = self.cam2_ui_q.get_nowait()
+                    for n in names2:
+                        if n not in self.live_present_set:
+                            self.live_present_set.add(n)
+                            newly_detected = True
                 except queue.Empty: pass
+
+            if newly_detected:
+                self.refresh_roster_display()
             
             if (now - self.last_fps_time) >= 1.0:
                 self.sys_fps = self.frames_rendered / (now - self.last_fps_time)
@@ -1367,11 +1430,10 @@ class AttendanceApp(ctk.CTk):
             if target_frame is not None:
                 self.frames_rendered += 1
                 
-                # Dynamic 16:9 aspect-ratio scaling based on live container dimensions
                 curr_w = self.video_container.winfo_width()
                 curr_h = self.video_container.winfo_height()
-                avail_w = max(160, curr_w - 4)
-                avail_h = max(90, curr_h - 4)
+                avail_w = max(160, curr_w - 8)
+                avail_h = max(90, curr_h - 8)
                 
                 if (avail_w / avail_h) > (16.0 / 9.0):
                     render_h = avail_h
@@ -1398,5 +1460,11 @@ class AttendanceApp(ctk.CTk):
 if __name__ == "__main__":
     mp.freeze_support()
     mp.set_start_method('spawn', force=True)
-    app = AttendanceApp()
-    app.mainloop()
+    try:
+        app = AttendanceApp()
+        app.mainloop()
+    except Exception as e:
+        if "no display name" in str(e) or "$DISPLAY" in str(e) or "couldn't connect to display" in str(e):
+            print(f"\n[ERROR] Display connection failed: {e}")
+            print("[INFO] No active X display found. If connecting remotely via SSH, enable X11 forwarding with 'ssh -X' or 'ssh -Y', or set 'export DISPLAY=:1'.")
+        raise

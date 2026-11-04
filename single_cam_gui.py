@@ -1,4 +1,24 @@
 import os
+import sys
+
+# Auto-configure display for X11 / Tkinter if running in headless/remote terminal
+if not os.environ.get("DISPLAY"):
+    import glob
+    for _sock in sorted(glob.glob("/tmp/.X11-unix/X*"), reverse=True):
+        _disp = ":" + _sock.split("X")[-1]
+        try:
+            import subprocess
+            if subprocess.run(["xset", "q"], env=dict(os.environ, DISPLAY=_disp), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                os.environ["DISPLAY"] = _disp
+                break
+        except Exception:
+            pass
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":1"
+
+if not os.environ.get("XAUTHORITY") and os.path.exists(f"/run/user/{os.getuid()}/gdm/Xauthority"):
+    os.environ["XAUTHORITY"] = f"/run/user/{os.getuid()}/gdm/Xauthority"
+
 import cv2
 import threading
 import queue
