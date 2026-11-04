@@ -2,19 +2,17 @@
 # sweep_yolo_sota.py – DGX A100 GPU-Accelerated Hyperparameter Optimizer (Stage 2)
 # ==============================================================================
 # Upgrades:
-#   1. Strict GPU 0 isolation (leaves other GPUs completely untouched).
-#   2. Main Process ID (PID) displayed at startup for SPCLAB-DGX_Utilization.xlsx.
-#   3. Standardized directory layout under ATTENDENCE RESULTS:
-#      - Shared feature cache: ATTENDENCE RESULTS/feature_cache
-#      - Sweep outputs: ATTENDENCE RESULTS/sweep
-#   4. All discovered videos from VIDEOS/ evaluated (instead of hardcoded 4).
-#   5. Unified Stage 1 (.pt cache with frame boxes, timestamps, and landmarks).
-#   6. Stage 2: Epoch-Based Coordinate Ascent / Progressive Local Neighborhood Optimizer.
-#      - Locks low-variance variables (SOFTMAX_TAU=5.0, NORM_QUALITY=7.0, MIN_FRAMES=30).
-#      - 7 active variables with 1D +-Delta, +-2Delta and 2D pairwise interaction steps.
-#      - Vectorized GPU batch evaluation across all cached videos on CUDA:0.
-#      - Real-time Rich progress bar, effective FPS telemetry, sweep_progress.json & live_status.txt.
-#      - Full resume support from sweep_final_accuracy.csv & leaderboard visualization.
+#   1. Multi-GPU acceleration across ACTIVE_GPUS with clean single-line Rich progress.
+#      - No multi-line terminal flooding: GPU % done and ETA update inline on the epoch bar.
+#   2. Daily Detection Count Objective (matching process_daily_attendance.py):
+#      - Combines all protocols/videos of the same day by summing confirmed track detections
+#        per (Date, Student) and dynamically finding the optimal daily detection count
+#        threshold (1..20) that maximizes Daily Attendance Accuracy.
+#      - Retains Session_Accuracy and per-protocol accuracies (5m, 10m, 15m, 20m, 30m)
+#        as secondary diagnostics.
+#   3. Broader 10-Variable Search Space & Extended 20-Epoch Schedule:
+#      - All 10 hyperparameters unlocked and swept across wider bounds.
+#      - Smooth 0.65x coordinate step decay across 20 epochs with 1D & 2D steps.
 # ==============================================================================
 
 import os
@@ -33,7 +31,6 @@ import pickle
 import warnings
 import threading
 import itertools
-from collections import Counter
 import concurrent.futures
 import multiprocessing as mp
 
@@ -74,23 +71,28 @@ console = Console()
 # ==========================================
 # 1. OPTIMIZER CONFIGURATION & ACTIVE VARIABLES
 # ==========================================
-# Fixed low-variance variables locked from Stage 2 analysis
-SOFTMAX_TAU            = 5.0
-NORM_QUALITY_THRESHOLD = 7.0
-MIN_TOTAL_FRAMES       = 30
-
-# 7 Active parameters to optimize with bounds, initial steps, and type
+# All 10 parameters unlocked with broader search ranges
 ACTIVE_VARS = {
-    "CONFIDENCE_THRESHOLD": {"center": 0.40, "min": 0.30, "max": 0.55, "step": 0.03, "is_int": False},
-    "EMA_MOMENTUM":          {"center": 0.85, "min": 0.50, "max": 0.95, "step": 0.05, "is_int": False},
-    "FRAMES_PER_VOTE":       {"center": 3,    "min": 2,    "max": 8,    "step": 1,    "is_int": True},
-    "MIN_BOX_SIZE":          {"center": 60.0, "min": 45.0, "max": 75.0, "step": 5.0,  "is_int": False},
-    "MIN_TOTAL_SAMPLES":     {"center": 20,   "min": 10,   "max": 40,   "step": 5,    "is_int": True},
-    "MIN_SAMPLE_RATIO":      {"center": 0.40, "min": 0.20, "max": 0.60, "step": 0.05, "is_int": False},
-    "MIN_WIN_RATIO":         {"center": 0.45, "min": 0.35, "max": 0.60, "step": 0.04, "is_int": False},
+    "CONFIDENCE_THRESHOLD":   {"center": 0.38, "min": 0.22, "max": 0.65, "step": 0.05, "is_int": False},
+    "NORM_QUALITY_THRESHOLD": {"center": 7.0,  "min": 3.0,  "max": 14.0, "step": 1.5,  "is_int": False},
+    "EMA_MOMENTUM":           {"center": 0.84, "min": 0.35, "max": 0.98, "step": 0.08, "is_int": False},
+    "FRAMES_PER_VOTE":        {"center": 2,    "min": 1,    "max": 12,   "step": 2,    "is_int": True},
+    "SOFTMAX_TAU":            {"center": 5.0,  "min": 1.5,  "max": 12.0, "step": 1.5,  "is_int": False},
+    "MIN_BOX_SIZE":           {"center": 50.0, "min": 45.0, "max": 95.0, "step": 8.0,  "is_int": False},
+    "MIN_TOTAL_FRAMES":       {"center": 30,   "min": 10,   "max": 80,   "step": 10,   "is_int": True},
+    "MIN_TOTAL_SAMPLES":      {"center": 16,   "min": 4,    "max": 55,   "step": 6,    "is_int": True},
+    "MIN_SAMPLE_RATIO":       {"center": 0.40, "min": 0.10, "max": 0.75, "step": 0.08, "is_int": False},
+    "MIN_WIN_RATIO":          {"center": 0.39, "min": 0.20, "max": 0.80, "step": 0.07, "is_int": False},
 }
 
-TOP4_VARS = ["MIN_WIN_RATIO", "EMA_MOMENTUM", "FRAMES_PER_VOTE", "CONFIDENCE_THRESHOLD"]
+TOP6_VARS = [
+    "CONFIDENCE_THRESHOLD",
+    "MIN_WIN_RATIO",
+    "MIN_SAMPLE_RATIO",
+    "MIN_TOTAL_SAMPLES",
+    "FRAMES_PER_VOTE",
+    "EMA_MOMENTUM",
+]
 
 ALL_PARAM_KEYS = [
     "CONFIDENCE_THRESHOLD",
@@ -105,12 +107,17 @@ ALL_PARAM_KEYS = [
     "MIN_WIN_RATIO",
 ]
 
-MAX_EPOCHS = 10
-BASE_MIN_BOX_SIZE = 45.0  
+MAX_EPOCHS = 40
+STEP_DECAY = 0.65
+MAX_DAILY_THRESHOLD = 20
+MIN_FRAMES_FLOOR = int(ACTIVE_VARS["MIN_TOTAL_FRAMES"]["min"])
+BASE_MIN_BOX_SIZE = 45.0
 FRAME_SKIP = 1
 MAX_STAGE1_WORKERS = 4
-GPU_BATCH_SIZE = 2048
-ACTIVE_GPUS = [0, 1, 2]
+GPU_BATCH_SIZE = 512
+AT_BUDGET = 600_000
+SIM_ROW_CHUNK_ELEMS = 1 << 27
+ACTIVE_GPUS = [1, 2, 3, 4]
 
 # ==========================================
 # 2. STANDARDIZED DIRECTORY PATHS
@@ -160,7 +167,6 @@ def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir, b
         name_map_df['Roll_Name'].astype(str).str.strip()
     ))
 
-    # Load protocol_mapping.csv from results_base_dir (fallback to base_dir or BASE_DIR)
     protocol_path = os.path.join(results_base_dir, "protocol_mapping.csv")
     if not os.path.exists(protocol_path):
         protocol_path = os.path.join(base_dir or BASE_DIR, "protocol_mapping.csv")
@@ -213,7 +219,8 @@ def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir, b
 
 
 def write_live_progress(sweep_dir, pid, epoch, max_epochs, completed_epoch, total_epoch, total_tested,
-                        combos_per_sec, effective_fps, elapsed_sec, eta_sec, best_acc, best_cid, best_params):
+                        combos_per_sec, effective_fps, elapsed_sec, eta_sec, best_acc, best_cid,
+                        best_thresh, best_params):
     """Writes real-time JSON and human-readable text status files."""
     pct = (completed_epoch / total_epoch * 100.0) if total_epoch > 0 else 100.0
     status_data = {
@@ -231,6 +238,7 @@ def write_live_progress(sweep_dir, pid, epoch, max_epochs, completed_epoch, tota
         "elapsed_min": round(elapsed_sec / 60.0, 2),
         "eta_min": round(eta_sec / 60.0, 2),
         "best_accuracy": round(best_acc, 4),
+        "best_daily_threshold": int(best_thresh) if best_thresh is not None else 1,
         "best_combo_id": best_cid,
         "best_params": best_params,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
@@ -253,7 +261,7 @@ def write_live_progress(sweep_dir, pid, epoch, max_epochs, completed_epoch, tota
         f"Speed    : {combos_per_sec:.2f} combos/sec\n"
         f"Throughput: {effective_fps:,.0f} Effective Video Frames/sec\n"
         f"Elapsed  : {elapsed_sec/60.0:.1f} min  |  ETA: {eta_sec/60.0:.1f} min\n"
-        f"Best Acc : {best_acc:.2f}% (Combo #{best_cid})\n"
+        f"Best Daily Acc: {best_acc:.2f}% (Combo #{best_cid}, Daily Count >= {status_data['best_daily_threshold']})\n"
         f"Best Param: {best_params}\n"
         f"=================================================================\n"
     )
@@ -814,9 +822,9 @@ def ensure_all_features_cached(target_videos, input_dir, cache_dir, ctx):
 
 
 # ==========================================
-# 6. STAGE 2: GPU-ACCELERATED BATCH EVALUATION
+# 6. STAGE 2: GPU-ACCELERATED BATCH EVALUATION (DAILY + SESSION)
 # ==========================================
-def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true_dict, base_to_protocol=None, device=None):
+def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true_dict, base_to_protocol=None):
     """
     Loads FAISS gallery and all valid cached video track tensors into CPU memory.
     Active GPU workers will load/transfer tensors directly to their respective GPU device.
@@ -894,338 +902,417 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
             })
 
     unique_sessions = len({v['base_ts'] for v in cpu_videos})
-    console.print(f"[bold green]OK Loaded {len(cpu_videos)} video caches across {unique_sessions} sessions into CPU memory ({total_cached_frames:,} total frames)[/bold green]")
+    unique_dates    = len({v['date_str'] for v in cpu_videos if v['date_str'] in true_dict})
+    console.print(
+        f"[bold green]OK Loaded {len(cpu_videos)} video caches across {unique_sessions} sessions "
+        f"({unique_dates} evaluated dates, {total_cached_frames:,} total frames)[/bold green]"
+    )
     return cpu_videos, ref_embs, target_names, y_real, roll_names, total_cached_frames
 
 
 @torch.no_grad()
-def _eval_track_batch(
-    embs, norms, frames_alive,
-    box_w, box_h,
-    ref_embs_t,
-    y_real_t,
-    b_norm_thresh,
-    b_frames_per_vote,
-    b_ema_momentum,
-    b_softmax_tau,
-    b_min_box_size,
-    b_min_total_frames,
-    b_min_total_samples,
-    b_min_sample_ratio,
-    b_conf_thresh,
-    b_min_win_ratio,
-    vote_counts,
-    total_preds,
-    n_classes,
-):
-    """
-    Evaluates one track across all B parameter combinations in the batch on GPU Tensor Cores.
-    vote_counts : (B, n_classes) float32 -- modified in-place
-    total_preds : (B,) int32             -- modified in-place
-    """
-    B = b_norm_thresh.shape[0]
-    S = embs.shape[0]
+def _fpv_info(bank, fpv):
+    """Per-FRAMES_PER_VOTE track ordering (cached). Tracks are sorted by window count (desc) so that at
+    window step w the still-active tracks are always a *prefix* -> no masking / no Python per-track loop."""
+    cache = bank['fpv_cache']
+    if fpv in cache:
+        return cache[fpv]
+    lens = bank['lens_np']
+    ok = np.nonzero(lens >= fpv)[0]
+    if ok.size == 0:
+        cache[fpv] = None
+        return None
+    W = lens[ok] // fpv
+    order = np.argsort(-W, kind='stable')
+    sel = ok[order]
+    W_s = W[order]
+    Wmax = int(W_s[0])
+    asc = np.ascontiguousarray(W_s[::-1])
+    n_gt = len(W_s) - np.searchsorted(asc, np.arange(Wmax), side='right')
+    dev = bank['device']
+    tidx = torch.from_numpy(sel).to(dev)
+    info = {
+        'starts': bank['starts_t'][tidx],
+        'W_t': torch.from_numpy(W_s).to(dev),
+        'W_np': W_s,
+        'alive': bank['alive_t'][tidx],
+        'sess': bank['sess_t'][tidx],
+        'date': bank['date_t'][tidx],
+        'n_gt': n_gt,
+        'Wmax': Wmax,
+    }
+    cache[fpv] = info
+    return info
 
-    # Quick skip if track cannot satisfy minimum frame requirement for any combo
-    if frames_alive < b_min_total_frames.min().item() or S < b_frames_per_vote.min().item():
-        return vote_counts, total_preds
 
-    box_ok = (box_w.unsqueeze(0) >= b_min_box_size.unsqueeze(1)) & \
-             (box_h.unsqueeze(0) >= b_min_box_size.unsqueeze(1))  # (B, S)
-
-    alive_ok = (frames_alive >= b_min_total_frames)  # (B,)
-
-    for fpv_val in b_frames_per_vote.unique():
-        fpv = int(fpv_val.item())
-        combo_mask = (b_frames_per_vote == fpv_val)
-        active = combo_mask & alive_ok
-        if not active.any():
-            continue
-
-        act_idx = active.nonzero(as_tuple=True)[0]
-        A = act_idx.shape[0]
-
-        a_norm_thresh  = b_norm_thresh[act_idx]
-        a_ema_momentum = b_ema_momentum[act_idx]
-        a_softmax_tau  = b_softmax_tau[act_idx]
-        a_box_ok       = box_ok[act_idx]
-
-        masked_norms = norms.unsqueeze(0) * a_box_ok.float()  # (A, S)
-
-        num_full_windows = S // fpv
-        if num_full_windows == 0:
-            continue
-
-        used_S  = num_full_windows * fpv
-        embs_w  = embs[:used_S].view(num_full_windows, fpv, 512)
-        norms_w = masked_norms[:, :used_S].view(A, num_full_windows, fpv)
-
-        ema_emb  = None
-        a_votes  = torch.zeros(A, n_classes, device=embs.device, dtype=torch.float32)
-        a_totals = torch.zeros(A, dtype=torch.int32, device=embs.device)
-
-        a_mom_h = a_ema_momentum.unsqueeze(1).half()
-        a_inv_mom_h = (1.0 - a_ema_momentum.unsqueeze(1)).half()
-        a_conf_h = b_conf_thresh[act_idx].half()
-
-        for w in range(num_full_windows):
-            a_totals += 1
-
-            w_embs  = embs_w[w]        # (fpv, 512) half
-            w_norms = norms_w[:, w, :] # (A, fpv) float
-
-            q_mask_aw = (w_norms >= a_norm_thresh.unsqueeze(1))
-            any_valid = q_mask_aw.any(dim=1)  # (A,)
-            if not any_valid.any():
-                continue
-
-            weights = torch.softmax(w_norms / a_softmax_tau.unsqueeze(1), dim=1).half()  # (A, fpv)
-
-            # High-throughput Tensor Core matrix multiplication (A, fpv) @ (fpv, 512) -> (A, 512)
-            e_win = F.normalize(torch.mm(weights, w_embs), p=2, dim=1)
-
-            if ema_emb is None:
-                ema_emb = e_win
-            else:
-                ema_emb = F.normalize(a_mom_h * ema_emb + a_inv_mom_h * e_win, p=2, dim=1)
-
-            # Match against gallery in FP16 on Tensor Cores: (A, 512) @ (512, G) -> (A, G)
-            sim = torch.mm(ema_emb, ref_embs_t)
-            max_sim, max_idx = sim.max(dim=1)
-            pred_class = y_real_t[max_idx]
-
-            is_conf = (max_sim >= a_conf_h) & any_valid
-
-            if is_conf.any():
-                conf_idx = is_conf.nonzero(as_tuple=True)[0]
-                conf_cls = pred_class[conf_idx]
-                a_votes[conf_idx, conf_cls] += 1.0
-
-        vote_counts[act_idx] += a_votes
-        total_preds[act_idx] += a_totals
-
-    return vote_counts, total_preds
+def _chunked_max_sim(q, ref_t):
+    """q: (R,512), ref_t: (512,G)  ->  (max_sim (R,), argmax (R,)) without materialising a giant (R,G)."""
+    R = q.shape[0]
+    G = ref_t.shape[1]
+    rows_per = max(1, SIM_ROW_CHUNK_ELEMS // max(G, 1))
+    if R <= rows_per:
+        return torch.mm(q, ref_t).max(dim=1)
+    ms, ix = [], []
+    for r0 in range(0, R, rows_per):
+        m, i = torch.mm(q[r0:r0 + rows_per], ref_t).max(dim=1)
+        ms.append(m)
+        ix.append(i)
+    return torch.cat(ms), torch.cat(ix)
 
 
 @torch.no_grad()
-def evaluate_combo_batch_gpu(
-    combo_batch,
-    gpu_videos,
-    ref_embs_t,
-    target_names,
-    y_real,
-    roll_names,
-    true_dict,
-    short_to_roll,
-    device,
-):
+def _eval_fpv_group(bank, ref_embs_t, fpv, grp, P, presence, daily_counts, n_classes, at_budget, live):
     """
-    Evaluates a batch of parameter combinations across all cached videos at session/protocol level.
-    Returns a list of result dictionaries with overall accuracy, confusion matrix stats,
-    and per-protocol accuracies (e.g., Acc_5min, Acc_10min, Acc_15min, Acc_20min, Acc_30min).
+    Evaluates every combo in `grp` (all sharing FRAMES_PER_VOTE=fpv) against ALL tracks at once.
+    Accumulates:
+      - `presence` (B, n_sessions, n_classes): binary session presence for per-protocol diagnostics
+      - `daily_counts` (B, n_dates, n_classes): total confirmed track detections summed across all
+        protocols & cameras of the same date (matching process_daily_attendance.py).
     """
+    info = _fpv_info(bank, fpv)
+    if info is None:
+        return
+    dev = bank['device']
+    cdt = bank['dtype']
+
+    min_samples = int(P['MIN_TOTAL_SAMPLES'][grp].min().item())
+    Te = int((info['W_np'] >= min_samples).sum())
+    if Te == 0:
+        return
+
+    starts = info['starts'][:Te]
+    n_gt = info['n_gt']
+    Wmax = info['Wmax']
+    embs_flat, norms_flat = bank['embs'], bank['norms']
+    bw_flat, bh_flat = bank['box_w'], bank['box_h']
+    y_real_t = bank['y_real_t']
+    ar_f = torch.arange(fpv, device=dev)
+
+    n_dates = daily_counts.shape[1]
+    daily_counts_flat = daily_counts.view(-1)
+
+    A_chunk = max(1, at_budget // Te)
+    for a0 in range(0, grp.numel(), A_chunk):
+        sub = grp[a0:a0 + A_chunk]
+        A = sub.numel()
+
+        mbs   = P['MIN_BOX_SIZE'][sub].view(1, A, 1)
+        nth   = P['NORM_QUALITY_THRESHOLD'][sub].view(1, A, 1)
+        tau   = P['SOFTMAX_TAU'][sub].view(1, A, 1)
+        mom   = P['EMA_MOMENTUM'][sub].to(cdt).view(1, A, 1)
+        inv   = (1.0 - P['EMA_MOMENTUM'][sub]).to(cdt).view(1, A, 1)
+        conf  = P['CONFIDENCE_THRESHOLD'][sub].to(cdt).view(1, A)
+
+        ema    = torch.zeros(Te, A, 512, dtype=cdt, device=dev)
+        inited = torch.zeros(Te, A, dtype=torch.bool, device=dev)
+        votes  = torch.zeros(Te, A, n_classes, dtype=torch.int32, device=dev)
+        votes_flat = votes.view(Te * A, n_classes)
+        row_ids = torch.arange(Te * A, device=dev)
+
+        for w in range(Wmax):
+            n = int(min(n_gt[w], Te))
+            if n == 0:
+                break
+            live['w'] = w
+            live['tracks'] = n
+            live['rows_done'] += n * A
+
+            idx = starts[:n].unsqueeze(1) + (w * fpv) + ar_f.unsqueeze(0)       # (n, fpv)
+            w_embs = embs_flat[idx]                                              # (n, fpv, 512)
+            nrm    = norms_flat[idx]                                             # (n, fpv)
+            bw     = bw_flat[idx].unsqueeze(1)                                   # (n, 1, fpv)
+            bh     = bh_flat[idx].unsqueeze(1)
+
+            box_ok = (bw >= mbs) & (bh >= mbs)                                   # (n, A, fpv)
+            masked = nrm.unsqueeze(1) * box_ok                                   # (n, A, fpv)
+            valid  = (masked >= nth).any(dim=2)                                  # (n, A)
+
+            weights = torch.softmax(masked / tau, dim=2).to(cdt)                 # (n, A, fpv)
+            e_win = F.normalize(torch.bmm(weights, w_embs), p=2, dim=2)          # (n, A, 512)
+
+            prev = ema[:n]
+            blended = F.normalize(mom * prev + inv * e_win, p=2, dim=2)
+            new = torch.where(inited[:n].unsqueeze(2), blended, e_win)
+            ema[:n] = torch.where(valid.unsqueeze(2), new, prev)
+            inited[:n] |= valid
+
+            flat = ema[:n].reshape(n * A, 512)
+            max_sim, max_idx = _chunked_max_sim(flat, ref_embs_t)
+            cls = y_real_t[max_idx]
+            is_conf = (max_sim.view(n, A) >= conf) & valid
+            votes_flat[row_ids[:n * A], cls] += is_conf.reshape(-1).to(torch.int32)
+
+        # ---- confirm tracks ----
+        best_votes, best_cls = votes.max(dim=2)                                  # (Te, A)
+        total_valid = votes.sum(dim=2)                                           # (Te, A)
+        W_f = info['W_t'][:Te].unsqueeze(1)                                      # (Te, 1)
+        alive = info['alive'][:Te].unsqueeze(1)
+
+        alive_ok   = alive >= P['MIN_TOTAL_FRAMES'][sub].view(1, A)
+        samples_ok = W_f >= P['MIN_TOTAL_SAMPLES'][sub].view(1, A)
+        sample_ratio = best_votes.float() / W_f.float().clamp(min=1)
+        win_ratio    = best_votes.float() / total_valid.float().clamp(min=1)
+        confirmed = (alive_ok & samples_ok & (total_valid > 0)
+                     & (sample_ratio >= P['MIN_SAMPLE_RATIO'][sub].view(1, A))
+                     & (win_ratio >= P['MIN_WIN_RATIO'][sub].view(1, A)))
+        t_i, a_i = confirmed.nonzero(as_tuple=True)
+        if t_i.numel() > 0:
+            combo_idx = sub[a_i]
+            sess_idx  = info['sess'][:Te][t_i]
+            date_idx  = info['date'][:Te][t_i]
+            cls_idx   = best_cls[t_i, a_i]
+
+            # 1) Session-level binary presence (for per-protocol breakdown)
+            presence[combo_idx, sess_idx, cls_idx] = True
+
+            # 2) Daily total detection count across all protocols & cameras of the same day
+            flat_daily_idx = (combo_idx * n_dates + date_idx) * n_classes + cls_idx
+            ones = torch.ones(flat_daily_idx.numel(), dtype=torch.int32, device=dev)
+            daily_counts_flat.index_add_(0, flat_daily_idx, ones)
+
+        del ema, inited, votes, votes_flat, row_ids, best_votes, best_cls, total_valid, confirmed
+
+
+@torch.no_grad()
+def build_track_bank(cpu_videos, true_dict, roll_names, y_real, device, min_frames_floor, dtype=torch.float16):
+    """
+    Flattens EVERY track of EVERY video into contiguous GPU tensors (once at startup)
+    and pre-builds both the Daily ground-truth masks and Session/Protocol ground-truth masks.
+    """
+    all_sessions = sorted({v['base_ts'] for v in cpu_videos if v['date_str'] in true_dict})
+    session_to_idx = {s: i for i, s in enumerate(all_sessions)}
+
+    all_dates = sorted({v['date_str'] for v in cpu_videos if v['date_str'] in true_dict})
+    date_to_idx = {d: i for i, d in enumerate(all_dates)}
+
+    n_sessions = len(all_sessions)
+    n_dates    = len(all_dates)
+    n_persons  = len(roll_names)
+
+    session_protocol = {}
+    embs_l, norms_l, bw_l, bh_l = [], [], [], []
+    starts, lens, alive, sess, dates = [], [], [], [], []
+    cursor = 0
+    for v in cpu_videos:
+        s_idx = session_to_idx.get(v['base_ts'], -1)
+        d_idx = date_to_idx.get(v['date_str'], -1)
+        if s_idx < 0 or d_idx < 0:
+            continue
+        session_protocol.setdefault(v['base_ts'], v.get('protocol', 'Unknown'))
+        for td in v['tracks']:
+            S = int(td['embs'].shape[0])
+            fa = int(td['frames_alive'])
+            if S == 0 or fa < min_frames_floor:
+                continue
+            embs_l.append(td['embs']); norms_l.append(td['norms'])
+            bw_l.append(td['box_w']);  bh_l.append(td['box_h'])
+            starts.append(cursor); lens.append(S); alive.append(fa)
+            sess.append(s_idx); dates.append(d_idx)
+            cursor += S
+
+    if embs_l:
+        embs  = torch.cat(embs_l).to(dtype).to(device)
+        norms = torch.cat(norms_l).float().to(device)
+        bw    = torch.cat(bw_l).float().to(device)
+        bh    = torch.cat(bh_l).float().to(device)
+    else:
+        embs  = torch.zeros(0, 512, dtype=dtype, device=device)
+        norms = bw = bh = torch.zeros(0, dtype=torch.float32, device=device)
+
+    # 1) Session-level ground truth masks
+    gt_present = np.zeros((n_sessions, n_persons), dtype=bool)
+    gt_valid   = np.zeros((n_sessions, n_persons), dtype=bool)
+    for s_idx, base_ts in enumerate(all_sessions):
+        date_map = true_dict.get(base_ts.split('_')[0], {})
+        for cls_i, roll in enumerate(roll_names):
+            tv = date_map.get(roll, '')
+            if tv in ('unknown', 'nan', 'none', ''):
+                continue
+            gt_valid[s_idx, cls_i] = True
+            if tv == 'present':
+                gt_present[s_idx, cls_i] = True
+
+    # 2) Daily ground truth masks (all protocols of the same day combined)
+    gt_daily_present = np.zeros((n_dates, n_persons), dtype=bool)
+    gt_daily_valid   = np.zeros((n_dates, n_persons), dtype=bool)
+    for d_idx, date_str in enumerate(all_dates):
+        date_map = true_dict.get(date_str, {})
+        for cls_i, roll in enumerate(roll_names):
+            tv = date_map.get(roll, '')
+            if tv in ('unknown', 'nan', 'none', ''):
+                continue
+            gt_daily_valid[d_idx, cls_i] = True
+            if tv == 'present':
+                gt_daily_present[d_idx, cls_i] = True
+
+    std_protocols = ['5 min', '10 min', '15 min', '20 min', '30 min']
+    active = sorted({session_protocol[s] for s in all_sessions if s in session_protocol})
+    eval_protocols = [p for p in std_protocols if p in active]
+    eval_protocols += [p for p in active if p not in eval_protocols and p != 'Unknown']
+    if 'Unknown' in active:
+        eval_protocols.append('Unknown')
+    proto_sidx = {}
+    for p in eval_protocols:
+        ids = [i for i, s in enumerate(all_sessions) if session_protocol.get(s) == p]
+        proto_sidx[f"Acc_{p.replace(' ', '')}"] = torch.tensor(ids, dtype=torch.int64, device=device)
+
+    return {
+        'device': device, 'dtype': dtype,
+        'T': len(lens), 'N': cursor,
+        'embs': embs, 'norms': norms, 'box_w': bw, 'box_h': bh,
+        'lens_np': np.asarray(lens, dtype=np.int64),
+        'starts_t': torch.tensor(starts, dtype=torch.int64, device=device),
+        'alive_t':  torch.tensor(alive,  dtype=torch.int64, device=device),
+        'sess_t':   torch.tensor(sess,   dtype=torch.int64, device=device),
+        'date_t':   torch.tensor(dates,  dtype=torch.int64, device=device),
+        'y_real_t': torch.tensor(y_real, dtype=torch.int64, device=device),
+        'min_frames_floor': int(min_frames_floor),
+        'n_sessions': n_sessions, 'n_dates': n_dates, 'n_persons': n_persons,
+        'all_sessions': all_sessions, 'all_dates': all_dates,
+        'gt_present':       torch.from_numpy(gt_present).to(device),
+        'gt_valid':         torch.from_numpy(gt_valid).to(device),
+        'gt_daily_present': torch.from_numpy(gt_daily_present).to(device),
+        'gt_daily_valid':   torch.from_numpy(gt_daily_valid).to(device),
+        'proto_sidx': proto_sidx,
+        'fpv_cache': {},
+    }
+
+
+@torch.no_grad()
+def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, device, at_budget=None, tag=0):
+    """
+    Evaluates a batch of parameter combinations against all cached tracks.
+    Primary Objective (`Overall_Accuracy`):
+      - Combines all protocols/videos on the same date into daily detection counts per student
+        and selects the optimal threshold t in 1..20 (matching process_daily_attendance.py).
+    Secondary Diagnostics:
+      - `Session_Accuracy` and per-protocol accuracies (`Acc_5min`, etc.).
+    """
+    at_budget = at_budget or AT_BUDGET
     B = len(combo_batch)
     if B == 0:
         return []
 
-    n_classes = len(target_names)
-    y_real_t = torch.tensor(y_real, dtype=torch.int64, device=device)
+    n_classes = bank['n_persons']
 
     def _pt(key, dtype=torch.float32):
         return torch.tensor([p[key] for _, p in combo_batch], dtype=dtype, device=device)
 
-    b_conf_thresh       = _pt("CONFIDENCE_THRESHOLD")
-    b_norm_thresh       = _pt("NORM_QUALITY_THRESHOLD")
-    b_ema_momentum      = _pt("EMA_MOMENTUM")
-    b_frames_per_vote   = _pt("FRAMES_PER_VOTE", torch.int64)
-    b_softmax_tau       = _pt("SOFTMAX_TAU")
-    b_min_box_size      = _pt("MIN_BOX_SIZE")
-    b_min_total_frames  = _pt("MIN_TOTAL_FRAMES", torch.int64)
-    b_min_total_samples = _pt("MIN_TOTAL_SAMPLES", torch.int64)
-    b_min_sample_ratio  = _pt("MIN_SAMPLE_RATIO")
-    b_min_win_ratio     = _pt("MIN_WIN_RATIO")
+    P = {k: _pt(k) for k in ["CONFIDENCE_THRESHOLD", "NORM_QUALITY_THRESHOLD", "EMA_MOMENTUM", "SOFTMAX_TAU",
+                             "MIN_BOX_SIZE", "MIN_SAMPLE_RATIO", "MIN_WIN_RATIO"]}
+    for k in ["MIN_TOTAL_FRAMES", "MIN_TOTAL_SAMPLES"]:
+        P[k] = _pt(k, torch.int64)
 
-    # Group by Session (base_ts) instead of Date:
-    # all_sessions is the sorted list of unique base_ts present in gpu_videos whose date_str exists in true_dict
-    all_sessions = sorted(list({
-        vid['base_ts'] for vid in gpu_videos
-        if vid.get('date_str', vid['base_ts'].split('_')[0]) in true_dict
-    }))
-    n_sessions = len(all_sessions)
-    n_persons = n_classes
-    session_to_idx = {s: i for i, s in enumerate(all_sessions)}
+    if int(P['MIN_TOTAL_FRAMES'].min().item()) < bank['min_frames_floor']:
+        raise ValueError("MIN_TOTAL_FRAMES below the floor used when the track bank was built.")
 
-    # Session to Protocol mapping from gpu_videos
-    session_protocol = {}
-    for vid in gpu_videos:
-        b_ts = vid['base_ts']
-        if b_ts not in session_protocol:
-            session_protocol[b_ts] = vid.get('protocol', 'Unknown')
+    n_sessions = bank['n_sessions']
+    n_dates    = bank['n_dates']
+    presence     = torch.zeros(B, max(n_sessions, 1), n_classes, dtype=torch.bool, device=device)
+    daily_counts = torch.zeros(B, max(n_dates, 1), n_classes, dtype=torch.int32, device=device)
 
-    # Define protocols to evaluate in standard order
-    std_protocols = ['5 min', '10 min', '15 min', '20 min', '30 min']
-    unique_active_protocols = sorted(list(set(session_protocol[s] for s in all_sessions if s in session_protocol)))
-    eval_protocols = [p for p in std_protocols if p in unique_active_protocols]
-    for p in unique_active_protocols:
-        if p not in eval_protocols and p != 'Unknown':
-            eval_protocols.append(p)
-    if 'Unknown' in unique_active_protocols and 'Unknown' not in eval_protocols:
-        eval_protocols.append('Unknown')
-    proto_cols = [f"Acc_{p.replace(' ', '')}" for p in eval_protocols]
+    if n_sessions > 0 and bank['T'] > 0:
+        fpv_list = [int(p['FRAMES_PER_VOTE']) for _, p in combo_batch]
 
-    if n_sessions == 0:
-        results = []
-        for combo_id, params in combo_batch:
-            res = {
-                "Combo_ID": combo_id,
-                **params,
-                "Overall_Accuracy": 0.0,
-            }
-            for col_name in proto_cols:
-                res[col_name] = 0.0
-            res.update({
-                "Matches": 0,
-                "Total_Valid": 0,
-                "TP": 0,
-                "TN": 0,
-                "FP": 0,
-                "FN": 0,
-            })
-            results.append(res)
-        return results
-
-    # Allocate presence tensor of shape (B, n_sessions, n_persons)
-    presence = torch.zeros(B, n_sessions, n_persons, dtype=torch.bool, device=device)
-
-    for vid_info in gpu_videos:
-        base_ts = vid_info['base_ts']
-        s_idx = session_to_idx.get(base_ts, -1)
-        if s_idx < 0:
-            continue
-
-        tracks = vid_info['tracks']
-        for td in tracks:
-            embs         = td['embs']
-            norms        = td['norms']
-            frames_alive = td['frames_alive']
-            box_w        = td['box_w']
-            box_h        = td['box_h']
-            if embs.shape[0] == 0:
+        groups = []
+        for fpv in sorted(set(fpv_list)):
+            grp = torch.tensor([i for i, f in enumerate(fpv_list) if f == fpv], dtype=torch.int64, device=device)
+            info = _fpv_info(bank, fpv)
+            if info is None:
                 continue
-
-            vote_counts = torch.zeros(B, n_classes, device=device, dtype=torch.float32)
-            total_preds = torch.zeros(B, dtype=torch.int32, device=device)
-
-            _eval_track_batch(
-                embs, norms, frames_alive,
-                box_w, box_h,
-                ref_embs_t, y_real_t,
-                b_norm_thresh, b_frames_per_vote, b_ema_momentum,
-                b_softmax_tau, b_min_box_size, b_min_total_frames,
-                b_min_total_samples, b_min_sample_ratio,
-                b_conf_thresh, b_min_win_ratio,
-                vote_counts, total_preds,
-                n_classes,
-            )
-
-            best_class_votes, best_class_idx = vote_counts.max(dim=1)
-            total_valid_votes = vote_counts.sum(dim=1)
-
-            alive_ok     = (frames_alive >= b_min_total_frames)
-            samples_ok   = (total_preds.long() >= b_min_total_samples)
-            sample_ratio = best_class_votes / (total_preds.float().clamp(min=1))
-            sample_ok_r  = (sample_ratio >= b_min_sample_ratio)
-            win_ratio    = best_class_votes / (total_valid_votes.clamp(min=1))
-            win_ok       = (win_ratio >= b_min_win_ratio)
-            has_votes    = (total_valid_votes > 0)
-
-            confirmed = alive_ok & samples_ok & sample_ok_r & win_ok & has_votes
-            conf_idx = confirmed.nonzero(as_tuple=True)[0]
-            if conf_idx.numel() > 0:
-                cls_idx = best_class_idx[conf_idx]
-                # Combine cam1 and cam2 of the same base_ts via logical OR
-                presence[conf_idx, s_idx, cls_idx] = True
-
-    # Vectorize Confusion Matrix & Ground Truth Comparison:
-    # Build ground truth boolean masks for each session (date_str = base_ts.split('_')[0])
-    gt_present = torch.zeros((n_sessions, n_persons), dtype=torch.bool, device=device)
-    gt_valid   = torch.zeros((n_sessions, n_persons), dtype=torch.bool, device=device)
-
-    for s_idx, base_ts in enumerate(all_sessions):
-        date_str = base_ts.split('_')[0]
-        date_true_map = true_dict.get(date_str, {})
-        for cls_i, roll_name in enumerate(roll_names):
-            true_val = date_true_map.get(roll_name, '')
-            if true_val in ('unknown', 'nan', 'none', ''):
+            min_s = int(P['MIN_TOTAL_SAMPLES'][grp].min().item())
+            Te = int((info['W_np'] >= min_s).sum())
+            if Te == 0:
                 continue
-            gt_valid[s_idx, cls_i] = True
-            if true_val == 'present':
-                gt_present[s_idx, cls_i] = True
+            work = int(grp.numel()) * int(np.minimum(info['n_gt'], Te).sum())
+            groups.append((fpv, grp, work, info['Wmax']))
 
-    # Vectorized confusion matrix components
-    tp_tensor = presence & gt_present & gt_valid
-    tn_tensor = (~presence) & (~gt_present) & gt_valid
-    fp_tensor = presence & (~gt_present) & gt_valid
-    fn_tensor = (~presence) & gt_present & gt_valid
-    matches_tensor = tp_tensor | tn_tensor
+        live = {
+            'phase': 'running',
+            'rows_done': 0,
+            'rows_total': max(1, sum(g[2] for g in groups)),
+            't0': time.perf_counter(),
+        }
+        LIVE_STATUS[tag] = live
+        for gi, (fpv, grp, work, Wmax) in enumerate(groups, start=1):
+            _eval_fpv_group(bank, ref_embs_t, fpv, grp, P, presence, daily_counts, n_classes, at_budget, live)
+        live['phase'] = 'finalising'
 
-    overall_tp = tp_tensor.sum(dim=(1, 2)).cpu().tolist()
-    overall_tn = tn_tensor.sum(dim=(1, 2)).cpu().tolist()
-    overall_fp = fp_tensor.sum(dim=(1, 2)).cpu().tolist()
-    overall_fn = fn_tensor.sum(dim=(1, 2)).cpu().tolist()
-    overall_matches = matches_tensor.sum(dim=(1, 2)).cpu().tolist()
-    total_valid_overall = int(gt_valid.sum().item())
+    # ---- 1. Daily Combined Evaluation (Threshold 1..20 Sweep per Combo) ----
+    gt_dp = bank['gt_daily_present'].unsqueeze(0).unsqueeze(0)  # (1, 1, n_dates, n_persons)
+    gt_dv = bank['gt_daily_valid'].unsqueeze(0).unsqueeze(0)    # (1, 1, n_dates, n_persons)
+    daily_counts = daily_counts[:, :n_dates, :]
 
-    # Vectorized protocol-wise accuracy calculation
+    thresh_t = torch.arange(1, MAX_DAILY_THRESHOLD + 1, device=device, dtype=torch.int32).view(1, -1, 1, 1)
+    est_daily = daily_counts.unsqueeze(1) >= thresh_t           # (B, 20, n_dates, n_persons)
+
+    tp_d = (est_daily & gt_dp & gt_dv).sum(dim=(2, 3))          # (B, 20)
+    tn_d = ((~est_daily) & (~gt_dp) & gt_dv).sum(dim=(2, 3))
+    fp_d = (est_daily & (~gt_dp) & gt_dv).sum(dim=(2, 3))
+    fn_d = ((~est_daily) & gt_dp & gt_dv).sum(dim=(2, 3))
+    matches_d = tp_d + tn_d                                     # (B, 20)
+
+    # Tie-breaker across thresholds: maximize matches, then maximize TP, then minimize FP
+    score_d = matches_d.to(torch.int64) * 1_000_000_000 + tp_d.to(torch.int64) * 1_000 - fp_d.to(torch.int64)
+    best_t_idx = score_d.argmax(dim=1)                          # (B,)
+    b_arange = torch.arange(B, device=device)
+
+    best_thresh_list = (best_t_idx + 1).cpu().tolist()
+    tp = tp_d[b_arange, best_t_idx].cpu().tolist()
+    tn = tn_d[b_arange, best_t_idx].cpu().tolist()
+    fp = fp_d[b_arange, best_t_idx].cpu().tolist()
+    fn = fn_d[b_arange, best_t_idx].cpu().tolist()
+    matches = matches_d[b_arange, best_t_idx].cpu().tolist()
+    total_daily_valid = int(bank['gt_daily_valid'].sum().item())
+
+    # ---- 2. Session & Protocol Breakdown Diagnostics ----
+    gt_present, gt_valid = bank['gt_present'], bank['gt_valid']
+    presence = presence[:, :n_sessions, :]
+    sess_match_t = ((presence & gt_present) | ((~presence) & (~gt_present))) & gt_valid
+    sess_matches = sess_match_t.sum(dim=(1, 2)).cpu().tolist()
+    total_sess_valid = int(gt_valid.sum().item())
+
     proto_accs = {}
-    for proto in eval_protocols:
-        s_indices = [i for i, s in enumerate(all_sessions) if session_protocol.get(s) == proto]
-        col_name = f"Acc_{proto.replace(' ', '')}"
-        if not s_indices:
-            proto_accs[col_name] = [0.0] * B
-            continue
-
-        s_indices_t = torch.tensor(s_indices, dtype=torch.int64, device=device)
-        proto_gt_valid = gt_valid[s_indices_t, :]
-        proto_total_valid = int(proto_gt_valid.sum().item())
-        if proto_total_valid > 0:
-            proto_matches = matches_tensor[:, s_indices_t, :].sum(dim=(1, 2))
-            accs = (proto_matches.float() / proto_total_valid * 100.0).cpu().tolist()
-            proto_accs[col_name] = [round(a, 4) for a in accs]
+    for col, s_idx_t in bank['proto_sidx'].items():
+        ptv = int(gt_valid[s_idx_t].sum().item())
+        if ptv > 0:
+            pm = sess_match_t[:, s_idx_t, :].sum(dim=(1, 2)).float() / ptv * 100.0
+            proto_accs[col] = [round(a, 4) for a in pm.cpu().tolist()]
         else:
-            proto_accs[col_name] = [0.0] * B
+            proto_accs[col] = [0.0] * B
 
-    # Compile result dictionaries
     results = []
     for b_i, (combo_id, params) in enumerate(combo_batch):
-        matches = overall_matches[b_i]
-        overall_acc = (matches / total_valid_overall * 100.0) if total_valid_overall > 0 else 0.0
-
+        daily_acc = (matches[b_i] / total_daily_valid * 100.0) if total_daily_valid > 0 else 0.0
+        sess_acc  = (sess_matches[b_i] / total_sess_valid * 100.0) if total_sess_valid > 0 else 0.0
         res = {
             "Combo_ID": combo_id,
             **params,
-            "Overall_Accuracy": round(overall_acc, 4),
+            "Best_Daily_Threshold": int(best_thresh_list[b_i]),
+            "Overall_Accuracy": round(daily_acc, 4),
+            "Daily_Accuracy": round(daily_acc, 4),
+            "Session_Accuracy": round(sess_acc, 4),
         }
-        for col_name in proto_cols:
-            res[col_name] = proto_accs[col_name][b_i]
-
+        for col in proto_accs:
+            res[col] = proto_accs[col][b_i]
         res.update({
-            "Matches": matches,
-            "Total_Valid": total_valid_overall,
-            "TP": overall_tp[b_i],
-            "TN": overall_tn[b_i],
-            "FP": overall_fp[b_i],
-            "FN": overall_fn[b_i],
+            "Matches": matches[b_i],
+            "Total_Valid": total_daily_valid,
+            "TP": tp[b_i],
+            "TN": tn[b_i],
+            "FP": fp[b_i],
+            "FN": fn[b_i],
         })
         results.append(res)
-
     return results
 
 
 # ==========================================
 # MULTI-GPU STAGE 2 WORKER EVALUATION POOL
 # ==========================================
-GPU_DATA_CACHE = {}
+GPU_DATA_CACHE = {}        # gpu_id -> (track_bank, ref_embs_t)
+LIVE_STATUS    = {}        # gpu_id -> concise telemetry dict
+RESULT_Q       = queue.Queue()
 target_names   = None
 y_real         = None
 roll_names     = None
@@ -1233,10 +1320,53 @@ true_dict      = None
 short_to_roll  = None
 
 
+def get_compact_gpu_summary():
+    """Returns a compact inline string with overall GPU batch % done and time left for the single-line progress bar."""
+    done_sum = 0
+    total_sum = 0
+    max_eta_sec = 0.0
+    any_running = False
+
+    for g in ACTIVE_GPUS:
+        st = LIVE_STATUS.get(g)
+        if not st:
+            continue
+        phase = st.get('phase')
+        if phase == 'running':
+            any_running = True
+            d = st.get('rows_done', 0)
+            t = max(1, st.get('rows_total', 1))
+            done_sum += d
+            total_sum += t
+            el = time.perf_counter() - st.get('t0', time.perf_counter())
+            if d > 0 and el > 1.0:
+                eta = el * (t - d) / d
+                if eta > max_eta_sec:
+                    max_eta_sec = eta
+        elif phase in ('finalising', 'idle'):
+            t = max(1, st.get('rows_total', 1))
+            done_sum += t
+            total_sum += t
+
+    if total_sum == 0:
+        return "GPU: 0.0% | ETA: --"
+
+    pct = min(100.0, 100.0 * done_sum / total_sum)
+    if any_running and max_eta_sec > 0:
+        if max_eta_sec >= 60.0:
+            eta_str = f"~{max_eta_sec / 60.0:.1f}m left"
+        else:
+            eta_str = f"~{max_eta_sec:.0f}s left"
+    elif pct >= 99.9:
+        eta_str = "done"
+    else:
+        eta_str = "estimating..."
+
+    return f"GPU: {pct:5.1f}% ({eta_str})"
+
+
 def chunk_combinations(items, num_chunks):
-    """
-    Chunks a list of (combo_id, params) into equal parts based on num_chunks.
-    """
+    """Chunks a list of (combo_id, params) into equal parts based on num_chunks."""
     if not items or num_chunks <= 0:
         return []
     k, m = divmod(len(items), num_chunks)
@@ -1250,44 +1380,29 @@ def chunk_combinations(items, num_chunks):
 
 
 def worker_evaluate_chunk(chunk, gpu_id):
-    """
-    Worker wrapper function that takes its assigned chunk of combinations and its assigned gpu_id,
-    sets device = torch.device(f'cuda:{gpu_id}'), and runs the batched evaluation
-    (evaluate_combo_batch_gpu) exclusively on that GPU using pre-staged GPU_DATA_CACHE.
-    """
+    """Runs this GPU's share of combos; each finished sub-batch is pushed to RESULT_Q for the main thread."""
     device = torch.device(f'cuda:{gpu_id}')
-    torch.cuda.set_device(device)
-
-    gpu_videos, ref_embs_t = GPU_DATA_CACHE[gpu_id]
-
-    num_batches = (len(chunk) + GPU_BATCH_SIZE - 1) // GPU_BATCH_SIZE
-    chunk_results = []
-
-    for b_i in range(num_batches):
-        b_start = b_i * GPU_BATCH_SIZE
-        b_end   = min(b_start + GPU_BATCH_SIZE, len(chunk))
-        combo_batch = chunk[b_start:b_end]
-
-        try:
-            batch_results = evaluate_combo_batch_gpu(
-                combo_batch, gpu_videos, ref_embs_t, target_names,
-                y_real, roll_names, true_dict, short_to_roll, device
-            )
-        except torch.cuda.OutOfMemoryError:
-            batch_results = []
-            half = max(1, len(combo_batch) // 2)
-            for s_start in range(0, len(combo_batch), half):
-                sub = combo_batch[s_start:s_start + half]
-                torch.cuda.empty_cache()
-                sub_res = evaluate_combo_batch_gpu(
-                    sub, gpu_videos, ref_embs_t, target_names,
-                    y_real, roll_names, true_dict, short_to_roll, device
-                )
-                batch_results.extend(sub_res)
-
-        chunk_results.extend(batch_results)
-
-    return chunk_results
+    bank, ref_embs_t = GPU_DATA_CACHE[gpu_id]
+    n_done = 0
+    LIVE_STATUS[gpu_id] = {'phase': 'starting', 'rows_done': 0, 'rows_total': 1, 't0': time.perf_counter()}
+    with torch.cuda.device(device):
+        for b_start in range(0, len(chunk), GPU_BATCH_SIZE):
+            combo_batch = chunk[b_start:b_start + GPU_BATCH_SIZE]
+            budget = AT_BUDGET
+            while True:
+                try:
+                    batch_results = evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, device, budget, gpu_id)
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    if budget <= 2000:
+                        raise
+                    budget //= 2
+            RESULT_Q.put(batch_results)
+            n_done += len(batch_results)
+    st = LIVE_STATUS.get(gpu_id, {})
+    LIVE_STATUS[gpu_id] = {'phase': 'idle', 'rows_done': st.get('rows_total', 1), 'rows_total': st.get('rows_total', 1)}
+    return n_done
 
 
 # ==========================================
@@ -1316,20 +1431,25 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
     for k in varied_keys:
         short_h = k.replace("_THRESHOLD", "").replace("MIN_", "")
         leader_table.add_column(short_h, justify="right")
-    leader_table.add_column("TP / TN / FP / FN", justify="center", style="magenta")
-    for pc in all_proto_cols:
-        leader_table.add_column(pc.replace("Acc_", ""), justify="right", style="cyan")
-    leader_table.add_column("Overall Accuracy", justify="right", style="bold green")
+    if "Best_Daily_Threshold" in df.columns:
+        leader_table.add_column("DayThr", justify="center", style="bold cyan")
+    leader_table.add_column("Daily TP/TN/FP/FN", justify="center", style="magenta")
+    if "Session_Accuracy" in df.columns:
+        leader_table.add_column("SessAcc", justify="right", style="cyan")
+    leader_table.add_column("Daily Accuracy", justify="right", style="bold green")
 
     for rank, (_, row) in enumerate(df_sorted.head(15).iterrows(), start=1):
         row_vals = [str(rank), f"#{int(row['Combo_ID'])}"]
         for k in varied_keys:
             val = row[k]
             row_vals.append(f"{int(val)}" if float(val).is_integer() else f"{val:.3f}")
-        row_vals.append(f"{int(row['TP'])} / {int(row['TN'])} / {int(row['FP'])} / {int(row['FN'])}")
-        for pc in all_proto_cols:
-            val = row.get(pc)
-            row_vals.append(f"{float(val):.2f}%" if pd.notna(val) else "--")
+        if "Best_Daily_Threshold" in df.columns:
+            thr_val = row.get("Best_Daily_Threshold", 1)
+            row_vals.append(f">={int(thr_val)}" if pd.notna(thr_val) else ">=1")
+        row_vals.append(f"{int(row['TP'])}/{int(row['TN'])}/{int(row['FP'])}/{int(row['FN'])}")
+        if "Session_Accuracy" in df.columns:
+            s_val = row.get("Session_Accuracy")
+            row_vals.append(f"{float(s_val):.2f}%" if pd.notna(s_val) else "--")
         row_vals.append(f"{row['Overall_Accuracy']:.2f}%")
         leader_table.add_row(*row_vals)
 
@@ -1337,29 +1457,37 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
     console.print(leader_table)
 
     best_params_str = "\n".join([f"  * [bold cyan]{k}[/bold cyan]: {best_row[k]}" for k in param_keys if k in best_row])
+    best_thr_val = int(best_row["Best_Daily_Threshold"]) if "Best_Daily_Threshold" in best_row and pd.notna(best_row["Best_Daily_Threshold"]) else 1
+    sess_acc_val = float(best_row["Session_Accuracy"]) if "Session_Accuracy" in best_row and pd.notna(best_row["Session_Accuracy"]) else 0.0
     proto_breakdown = "  ".join([f"[cyan]{pc.replace('Acc_', '')}:[/cyan] {best_row[pc]:.2f}%" for pc in all_proto_cols if pc in best_row and pd.notna(best_row[pc])])
+
     console.print(Panel(
-        f"[bold green]Max Overall Accuracy Achieved: {best_row['Overall_Accuracy']:.2f}% (Combo #{int(best_row['Combo_ID'])})[/bold green]\n"
-        + (f"[bold white]Protocol Accuracies:[/bold white] {proto_breakdown}\n" if proto_breakdown else "")
-        + f"[bold magenta]Confusion Breakdown:[/bold magenta] TP={int(best_row['TP'])}, TN={int(best_row['TN'])}, FP={int(best_row['FP'])}, FN={int(best_row['FN'])}\n\n"
+        f"[bold green]Max Daily Combined Accuracy: {best_row['Overall_Accuracy']:.2f}% (Combo #{int(best_row['Combo_ID'])}, Optimal Daily Detection Count >= {best_thr_val})[/bold green]\n"
+        + (f"[bold white]Individual Session Accuracy:[/bold white] {sess_acc_val:.2f}%   |   {proto_breakdown}\n" if proto_breakdown else "")
+        + f"[bold magenta]Daily Confusion Breakdown:[/bold magenta] TP={int(best_row['TP'])}, TN={int(best_row['TN'])}, FP={int(best_row['FP'])}, FN={int(best_row['FN'])}\n\n"
         f"[bold white]Optimal Generalization Parameters for test_yolo_sota.py:[/bold white]\n{best_params_str}",
-        title="Stage 2 Optimizer Conclusion",
+        title="Stage 2 Daily Attendance Optimizer Conclusion",
         expand=False
     ))
 
     fig = plt.figure(figsize=(18, 12), dpi=150)
     fig.suptitle(
-        f"Stage 2 Hyperparameter Optimizer Analysis ({len(df):,} Combos) -- Best Accuracy: {best_row['Overall_Accuracy']:.2f}%",
+        f"Stage 2 Daily Attendance Optimizer ({len(df):,} Combos) -- Best Daily Accuracy: {best_row['Overall_Accuracy']:.2f}% (Count >= {best_thr_val})",
         fontsize=16, fontweight='bold', y=0.98
     )
 
     # 1. Top 12 Combos
     ax1 = plt.subplot(2, 2, 1)
     top_n = df_sorted.head(12).iloc[::-1]
-    labels = [f"#{int(r['Combo_ID'])}" for _, r in top_n.iterrows()]
+    labels = [
+        f"#{int(r['Combo_ID'])} (>={int(r.get('Best_Daily_Threshold', 1))})"
+        if 'Best_Daily_Threshold' in r and pd.notna(r['Best_Daily_Threshold'])
+        else f"#{int(r['Combo_ID'])}"
+        for _, r in top_n.iterrows()
+    ]
     bars = ax1.barh(labels, top_n["Overall_Accuracy"], color="#2ecc71", edgecolor="#27ae60")
-    ax1.set_xlabel("Overall Accuracy (%)")
-    ax1.set_title("Top 12 Parameter Combinations", fontweight="bold")
+    ax1.set_xlabel("Daily Combined Accuracy (%)")
+    ax1.set_title("Top 12 Parameter Combinations (with Best Daily Count Threshold)", fontweight="bold")
     if len(top_n) > 0:
         min_x = max(0.0, top_n["Overall_Accuracy"].min() - 3.0)
         max_x = min(100.0, top_n["Overall_Accuracy"].max() + 1.5)
@@ -1368,15 +1496,15 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
         w = bar.get_width()
         ax1.text(w + 0.1, bar.get_y() + bar.get_height()/2, f"{w:.2f}%", va='center', fontsize=9, fontweight='bold')
 
-    # 2. 2D Heatmap or Epoch Progression
+    # 2. Epoch Progression
     ax2 = plt.subplot(2, 2, 2)
     if "Epoch" in df.columns and df["Epoch"].nunique() > 1:
         epoch_agg = df.groupby("Epoch")["Overall_Accuracy"].agg(["mean", "max"]).reset_index()
-        ax2.plot(epoch_agg["Epoch"], epoch_agg["max"], marker="o", color="#e74c3c", linewidth=2.5, label="Max Accuracy (%)")
-        ax2.plot(epoch_agg["Epoch"], epoch_agg["mean"], marker="s", color="#3498db", linewidth=2.0, linestyle="--", label="Mean Accuracy (%)")
+        ax2.plot(epoch_agg["Epoch"], epoch_agg["max"], marker="o", color="#e74c3c", linewidth=2.5, label="Max Daily Accuracy (%)")
+        ax2.plot(epoch_agg["Epoch"], epoch_agg["mean"], marker="s", color="#3498db", linewidth=2.0, linestyle="--", label="Mean Daily Accuracy (%)")
         ax2.set_xlabel("Epoch", fontweight="bold")
-        ax2.set_ylabel("Accuracy (%)", fontweight="bold")
-        ax2.set_title("Optimization Progression Across Epochs", fontweight="bold")
+        ax2.set_ylabel("Daily Accuracy (%)", fontweight="bold")
+        ax2.set_title("Daily Accuracy Progression Across Epochs", fontweight="bold")
         ax2.grid(True, alpha=0.3)
         ax2.legend()
     elif len(varied_keys) >= 2:
@@ -1389,8 +1517,8 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
         ax2.set_yticklabels([str(i) for i in pivot.index])
         ax2.set_xlabel(p2, fontweight="bold")
         ax2.set_ylabel(p1, fontweight="bold")
-        ax2.set_title(f"Max Accuracy Heatmap: {p1} vs {p2}", fontweight="bold")
-        plt.colorbar(im, ax=ax2, label="Max Accuracy (%)")
+        ax2.set_title(f"Max Daily Accuracy Heatmap: {p1} vs {p2}", fontweight="bold")
+        plt.colorbar(im, ax=ax2, label="Max Daily Accuracy (%)")
     else:
         ax2.text(0.5, 0.5, "Single Parameter Swept", ha="center", va="center")
 
@@ -1401,9 +1529,13 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
         pos = 0
         for k in varied_keys:
             grouped = df.groupby(k)["Overall_Accuracy"].agg(["mean", "max"]).reset_index()
+            # Keep chart readable when many slices exist by showing up to 8 quantile slices per variable
+            if len(grouped) > 8:
+                idx_sel = np.linspace(0, len(grouped) - 1, 8).round().astype(int)
+                grouped = grouped.iloc[np.unique(idx_sel)]
             for _, grow in grouped.iterrows():
                 x_positions.append(pos)
-                val_str = f"{int(grow[k])}" if float(grow[k]).is_integer() else f"{grow[k]:.3f}"
+                val_str = f"{int(grow[k])}" if float(grow[k]).is_integer() else f"{grow[k]:.2f}"
                 x_labels.append(f"{k.replace('_THRESHOLD', '').replace('MIN_', '')}\n={val_str}")
                 mean_vals.append(grow["mean"])
                 max_vals.append(grow["max"])
@@ -1412,14 +1544,14 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
 
         width = 0.38
         x_arr = np.array(x_positions)
-        ax3.bar(x_arr - width/2, mean_vals, width=width, label="Mean Accuracy (%)", color="#3498db")
-        ax3.bar(x_arr + width/2, max_vals, width=width, label="Max Accuracy (%)", color="#e67e22")
+        ax3.bar(x_arr - width/2, mean_vals, width=width, label="Mean Daily Accuracy (%)", color="#3498db")
+        ax3.bar(x_arr + width/2, max_vals, width=width, label="Max Daily Accuracy (%)", color="#e67e22")
         for b in group_boundaries[:-1]:
             ax3.axvline(b, color="gray", linestyle="--", alpha=0.5)
         ax3.set_xticks(x_arr)
         ax3.set_xticklabels(x_labels, rotation=35, ha="right", fontsize=8)
-        ax3.set_ylabel("Accuracy (%)")
-        ax3.set_title("Active Hyperparameter Sensitivity (Mean vs. Max Accuracy across tested slices)", fontweight="bold")
+        ax3.set_ylabel("Daily Accuracy (%)")
+        ax3.set_title("Active Hyperparameter Sensitivity (Mean vs. Max Daily Accuracy across tested slices)", fontweight="bold")
         if mean_vals:
             ax3.set_ylim(max(0.0, min(mean_vals) - 3.0), min(100.0, max(max_vals) + 1.5))
         ax3.legend(loc="lower right")
@@ -1445,7 +1577,8 @@ if __name__ == '__main__':
         f"[bold yellow]Main Process ID (PID) for Excel Sheet:[/bold yellow] [bold white]{main_pid}[/bold white]\n"
         f"[bold cyan]Multi-GPU Acceleration:[/bold cyan] Active GPUs: {ACTIVE_GPUS} ({gpu_desc})\n"
         f"[bold green]Shared Feature Cache:[/bold green] {FEATURE_CACHE_DIR}\n"
-        f"[bold magenta]Sweep Output Directory:[/bold magenta] {SWEEP_OUTPUT_DIR}",
+        f"[bold magenta]Sweep Output Directory:[/bold magenta] {SWEEP_OUTPUT_DIR}\n"
+        f"[bold white]Optimization Target:[/bold white] Daily Combined Attendance Accuracy (Protocols per day summed, Threshold 1..{MAX_DAILY_THRESHOLD})",
         title="DGX A100 GPU Hyperparameter Optimizer (Copy PID to SPCLAB-DGX_Utilization.xlsx)",
         expand=False
     ))
@@ -1503,41 +1636,25 @@ if __name__ == '__main__':
 
     num_cached_videos = len(cpu_videos)
 
-    # Pre-stage cached video tensors and gallery directly onto ACTIVE_GPUS
-    console.print(f"\n[bold cyan]Pre-staging cached video tensors directly onto GPUs {ACTIVE_GPUS}...[/bold cyan]")
+    # Pre-stage ONE flat "track bank" per GPU (with MIN_FRAMES_FLOOR = 10 to allow sweeping MIN_TOTAL_FRAMES down to 10)
+    console.print(f"\n[bold cyan]Pre-staging flattened track bank directly onto GPUs {ACTIVE_GPUS} (MIN_FRAMES_FLOOR={MIN_FRAMES_FLOOR})...[/bold cyan]")
     GPU_DATA_CACHE = {}
     for gpu_id in ACTIVE_GPUS:
         dev = torch.device(f"cuda:{gpu_id}")
-        ref_embs_t = ref_embs_cpu.to(dev, non_blocking=True).t().contiguous()
-        gpu_videos = []
-        for v in cpu_videos:
-            base_ts = v['base_ts']
-            date_str = v['date_str']
-            protocol = v['protocol']
-            gpu_tracks = []
-            for td in v['tracks']:
-                gpu_tracks.append({
-                    'frames_alive': td['frames_alive'],
-                    'box_w': td['box_w'].to(dev, non_blocking=True),
-                    'box_h': td['box_h'].to(dev, non_blocking=True),
-                    'embs' : td['embs'].to(dev, non_blocking=True),
-                    'norms': td['norms'].to(dev, non_blocking=True),
-                })
-            gpu_videos.append({
-                'base_ts': base_ts,
-                'date_str': date_str,
-                'protocol': protocol,
-                'tracks': gpu_tracks,
-            })
-        GPU_DATA_CACHE[gpu_id] = (gpu_videos, ref_embs_t)
-        unique_sessions = len({v['base_ts'] for v in gpu_videos})
-        console.print(f"  [bold green]OK Pre-staged {len(gpu_videos)} videos across {unique_sessions} sessions onto cuda:{gpu_id}[/bold green]")
+        ref_embs_t = ref_embs_cpu.to(dev).t().contiguous()
+        bank = build_track_bank(cpu_videos, true_dict, roll_names, y_real, dev, MIN_FRAMES_FLOOR)
+        GPU_DATA_CACHE[gpu_id] = (bank, ref_embs_t)
+        console.print(
+            f"  [bold green]OK cuda:{gpu_id}: {bank['T']:,} tracks, {bank['N']:,} embeddings, "
+            f"{bank['n_dates']} dates ({bank['n_sessions']} sessions), gallery={ref_embs_t.shape[1]:,}[/bold green]"
+        )
 
     del cpu_videos
     del ref_embs_cpu
     gc.collect()
 
     # 5. Initialize Progressive Epoch Optimizer
+    # Uses a dedicated CSV for daily-combined optimization so old session-only rows don't pollute the cache
     final_accuracy_csv = os.path.join(SWEEP_OUTPUT_DIR, "sweep_final_accuracy.csv")
 
     evaluated_cache = {}
@@ -1546,12 +1663,14 @@ if __name__ == '__main__':
     best_tp_so_far  = -1
     best_fp_so_far  = 999999
     best_cid_so_far = None
+    best_thr_so_far = 1
     best_params_so_far = None
 
     if os.path.exists(final_accuracy_csv):
         try:
             existing_df = pd.read_csv(final_accuracy_csv)
-            if not existing_df.empty and "Combo_ID" in existing_df.columns:
+            # Only resume from CSV if it already contains the new Daily_Accuracy / Best_Daily_Threshold schema
+            if not existing_df.empty and "Combo_ID" in existing_df.columns and "Best_Daily_Threshold" in existing_df.columns:
                 for _, row in existing_df.iterrows():
                     cid = int(row["Combo_ID"])
                     max_combo_id = max(max_combo_id, cid)
@@ -1562,68 +1681,54 @@ if __name__ == '__main__':
                         acc = float(row.get("Overall_Accuracy", 0.0))
                         tp  = int(row.get("TP", 0))
                         fp  = int(row.get("FP", 0))
+                        thr = int(row.get("Best_Daily_Threshold", 1))
                         if (acc > best_acc_so_far) or (acc == best_acc_so_far and tp > best_tp_so_far) or (acc == best_acc_so_far and tp == best_tp_so_far and fp < best_fp_so_far):
                             best_acc_so_far = acc
                             best_tp_so_far  = tp
                             best_fp_so_far  = fp
                             best_cid_so_far = cid
+                            best_thr_so_far = thr
                             best_params_so_far = p_dict
-                console.print(f"[bold cyan]Found {len(evaluated_cache)} already-evaluated combinations in {final_accuracy_csv}. Resuming...[/bold cyan]")
+                console.print(f"[bold cyan]Found {len(evaluated_cache)} already-evaluated daily combinations in {final_accuracy_csv}. Resuming...[/bold cyan]")
+            elif not existing_df.empty and "Best_Daily_Threshold" not in existing_df.columns:
+                backup_csv = os.path.join(SWEEP_OUTPUT_DIR, f"sweep_session_legacy_{int(time.time())}.csv")
+                os.replace(final_accuracy_csv, backup_csv)
+                console.print(f"[bold yellow]Archived legacy session-based CSV to {backup_csv} to start fresh daily-protocol optimization.[/bold yellow]")
         except Exception as e:
             console.print(f"[bold yellow]Warning reading existing sweep CSV: {e}[/bold yellow]")
 
-    # Initial baseline center point (Epoch 0 configuration)
+    # Initial baseline center point (seeded from your previous best combo #430)
     if best_params_so_far is not None:
         theta_star = dict(best_params_so_far)
     else:
-        theta_star = {
-            "CONFIDENCE_THRESHOLD":   0.40,
-            "NORM_QUALITY_THRESHOLD": NORM_QUALITY_THRESHOLD,
-            "EMA_MOMENTUM":           0.85,
-            "FRAMES_PER_VOTE":        3,
-            "SOFTMAX_TAU":            SOFTMAX_TAU,
-            "MIN_BOX_SIZE":           60.0,
-            "MIN_TOTAL_FRAMES":       MIN_TOTAL_FRAMES,
-            "MIN_TOTAL_SAMPLES":      20,
-            "MIN_SAMPLE_RATIO":       0.40,
-            "MIN_WIN_RATIO":          0.45,
-        }
+        theta_star = {k: cfg["center"] for k, cfg in ACTIVE_VARS.items()}
 
     current_steps = {k: v["step"] for k, v in ACTIVE_VARS.items()}
     t_opt_start = time.perf_counter()
 
-    console.print(f"\n[bold white]Starting Epoch-Based Coordinate Ascent Optimizer (MAX_EPOCHS={MAX_EPOCHS}):[/bold white]")
+    num_sessions = GPU_DATA_CACHE[ACTIVE_GPUS[0]][0]['n_sessions'] if ACTIVE_GPUS else 0
+    num_dates    = GPU_DATA_CACHE[ACTIVE_GPUS[0]][0]['n_dates'] if ACTIVE_GPUS else 0
+    console.print(f"\n[bold white]Starting 10-Variable Daily Attendance Optimizer (MAX_EPOCHS={MAX_EPOCHS}):[/bold white]")
     console.print(f"  * Parallel GPUs: {ACTIVE_GPUS}  |  Batch Size: {GPU_BATCH_SIZE} combos/batch per GPU")
-    num_sessions = len({v['base_ts'] for v in GPU_DATA_CACHE[ACTIVE_GPUS[0]][0]}) if ACTIVE_GPUS else 0
-    console.print(f"  * Cached Videos in Memory: {num_cached_videos} across {num_sessions} sessions ({total_cached_frames:,} total frames)\n")
+    console.print(f"  * Cached Videos: {num_cached_videos} across {num_dates} dates / {num_sessions} sessions ({total_cached_frames:,} total frames)\n")
 
-    # Multi-GPU ThreadPoolExecutor for Stage 2 Hyperparameter Evaluation
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(ACTIVE_GPUS)
-    ) as executor:
-        # Outer Epoch Loop
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ACTIVE_GPUS)) as executor:
         for epoch in range(1, MAX_EPOCHS + 1):
-            epoch_start_time = time.perf_counter()
-            console.print(f"\n[bold cyan]=== Epoch {epoch} / {MAX_EPOCHS} ===[/bold cyan]")
-            console.print(f"[dim]Current center theta*: {theta_star}[/dim]")
-            console.print(f"[dim]Current steps: {current_steps}[/dim]")
+            # 1. Generate broader candidate neighborhood around theta*
+            candidates = [dict(theta_star)]
 
-            # 1. Generate candidate neighborhood around theta*
-            candidates = []
-            candidates.append(dict(theta_star))
-
-            # 1D coordinate steps (theta_i +- Delta_i, theta_i +- 2*Delta_i)
+            # 1D coordinate steps: +-1*Delta, +-2*Delta, +-3*Delta across all 10 active variables
             for k, cfg in ACTIVE_VARS.items():
                 delta = current_steps[k]
-                for mult in [-2, -1, 1, 2]:
+                for mult in [-3, -2, -1, 1, 2, 3]:
                     val = theta_star[k] + mult * delta
                     val = max(cfg["min"], min(cfg["max"], val))
                     cand = dict(theta_star)
                     cand[k] = int(round(val)) if cfg["is_int"] else round(val, 4)
                     candidates.append(cand)
 
-            # 2D pairwise interaction steps for TOP4_VARS
-            for k1, k2 in itertools.combinations(TOP4_VARS, 2):
+            # 2D pairwise interaction steps for TOP6_VARS
+            for k1, k2 in itertools.combinations(TOP6_VARS, 2):
                 cfg1, cfg2 = ACTIVE_VARS[k1], ACTIVE_VARS[k2]
                 d1, d2 = current_steps[k1], current_steps[k2]
                 for s1 in [-1, 1]:
@@ -1654,49 +1759,49 @@ if __name__ == '__main__':
                     c_tp  = int(row.get("TP", 0))
                     c_fp  = int(row.get("FP", 0))
                     c_id  = int(row["Combo_ID"])
+                    c_thr = int(row.get("Best_Daily_Threshold", 1))
                     if (c_acc > best_acc_so_far) or (c_acc == best_acc_so_far and c_tp > best_tp_so_far) or (c_acc == best_acc_so_far and c_tp == best_tp_so_far and c_fp < best_fp_so_far):
                         best_acc_so_far = c_acc
                         best_tp_so_far  = c_tp
                         best_fp_so_far  = c_fp
                         best_cid_so_far = c_id
+                        best_thr_so_far = c_thr
                         best_params_so_far = {k: row[k] for k in ALL_PARAM_KEYS}
                 else:
                     pending_candidates.append(c)
 
             total_epoch_combos = len(unique_epoch_candidates)
             already_evaluated_in_epoch = total_epoch_combos - len(pending_candidates)
-
-            console.print(
-                f"Epoch {epoch}: {total_epoch_combos} candidate combinations "
-                f"({already_evaluated_in_epoch} cached, {len(pending_candidates)} pending evaluation)"
-            )
-
             improved_this_epoch = False
 
             if pending_candidates:
-                # Set up Rich Progress Bar
+                # Single-line Rich Progress Bar (updates in-place with GPU % and time left)
                 progress = Progress(
                     SpinnerColumn(),
                     TextColumn("[bold cyan]{task.description}"),
-                    BarColumn(bar_width=32),
+                    BarColumn(bar_width=28),
                     MofNCompleteColumn(),
                     TextColumn("[bold yellow]{task.percentage:>5.1f}%"),
                     TimeRemainingColumn(),
-                    TextColumn("[bold green]{task.fields[speed]}"),
+                    TextColumn("[bold green]{task.fields[gpu_info]}"),
                     TextColumn("[bold magenta]{task.fields[best]}"),
                     console=console,
-                    refresh_per_second=5
+                    transient=False,
+                    refresh_per_second=4
                 )
 
+                best_label = (
+                    f"Best: {best_acc_so_far:.2f}% (#{best_cid_so_far}, >={best_thr_so_far})"
+                    if best_cid_so_far is not None else "Best: --"
+                )
                 task_id = progress.add_task(
-                    f"Epoch {epoch}/{MAX_EPOCHS}",
+                    f"Epoch {epoch:02d}/{MAX_EPOCHS:02d}",
                     total=total_epoch_combos,
                     completed=already_evaluated_in_epoch,
-                    speed="Starting GPU batch...",
-                    best=f"Best: {best_acc_so_far:.2f}%" if best_cid_so_far else "Best: --"
+                    gpu_info="GPU: 0.0% (starting)",
+                    best=best_label
                 )
 
-                # Assign sequential combo IDs
                 pending_with_ids = []
                 for cand in pending_candidates:
                     max_combo_id += 1
@@ -1706,7 +1811,6 @@ if __name__ == '__main__':
                 epoch_eval_count = 0
                 epoch_eval_start = time.perf_counter()
 
-                # Chunk pending_with_ids into equal parts across ACTIVE_GPUS
                 chunks = chunk_combinations(pending_with_ids, len(ACTIVE_GPUS))
                 active_assignments = list(zip(chunks, ACTIVE_GPUS[:len(chunks)]))
 
@@ -1715,74 +1819,93 @@ if __name__ == '__main__':
                         executor.submit(worker_evaluate_chunk, chunk, gpu_id)
                         for chunk, gpu_id in active_assignments
                     ]
+                    not_done = set(futures)
 
-                    # Thread-Safe Aggregation: gather results sequentially as workers complete
-                    for fut in concurrent.futures.as_completed(futures):
-                        chunk_results = fut.result()
+                    while not_done or not RESULT_Q.empty():
+                        done, not_done = concurrent.futures.wait(
+                            not_done, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+                        for fut in done:
+                            fut.result()
 
-                        # Record results and update CSV
+                        new_batches = []
+                        while True:
+                            try:
+                                new_batches.append(RESULT_Q.get_nowait())
+                            except queue.Empty:
+                                break
+
                         buffer_rows = []
-                        for res in chunk_results:
-                            res["Epoch"] = epoch
-                            buffer_rows.append(res)
-                            evaluated_cache[param_key(res)] = res
-                            completed_in_epoch += 1
-                            epoch_eval_count += 1
+                        for chunk_results in new_batches:
+                            for res in chunk_results:
+                                res["Epoch"] = epoch
+                                buffer_rows.append(res)
+                                evaluated_cache[param_key(res)] = res
+                                completed_in_epoch += 1
+                                epoch_eval_count += 1
 
-                            acc = res["Overall_Accuracy"]
-                            tp  = res["TP"]
-                            fp  = res["FP"]
+                                acc = res["Overall_Accuracy"]
+                                tp  = res["TP"]
+                                fp  = res["FP"]
+                                thr = res.get("Best_Daily_Threshold", 1)
 
-                            if (acc > best_acc_so_far) or (acc == best_acc_so_far and tp > best_tp_so_far) or (acc == best_acc_so_far and tp == best_tp_so_far and fp < best_fp_so_far):
-                                best_acc_so_far    = acc
-                                best_tp_so_far     = tp
-                                best_fp_so_far     = fp
-                                best_cid_so_far    = res["Combo_ID"]
-                                best_params_so_far = {k: res[k] for k in ALL_PARAM_KEYS}
-                                improved_this_epoch = True
+                                if (acc > best_acc_so_far) or (acc == best_acc_so_far and tp > best_tp_so_far) or (acc == best_acc_so_far and tp == best_tp_so_far and fp < best_fp_so_far):
+                                    best_acc_so_far    = acc
+                                    best_tp_so_far     = tp
+                                    best_fp_so_far     = fp
+                                    best_cid_so_far    = res["Combo_ID"]
+                                    best_thr_so_far    = thr
+                                    best_params_so_far = {k: res[k] for k in ALL_PARAM_KEYS}
+                                    improved_this_epoch = True
 
                         if buffer_rows:
                             df_chunk = pd.DataFrame(buffer_rows)
                             write_header = not os.path.exists(final_accuracy_csv)
                             df_chunk.to_csv(final_accuracy_csv, mode='a', header=write_header, index=False)
 
-                        # Telemetry calculations
                         elapsed_total = time.perf_counter() - t_opt_start
                         elapsed_eval = time.perf_counter() - epoch_eval_start
                         combos_sec = epoch_eval_count / elapsed_eval if elapsed_eval > 0 else 0.0
                         eff_fps = combos_sec * total_cached_frames
-
                         remaining_combos_epoch = total_epoch_combos - completed_in_epoch
                         eta_sec = remaining_combos_epoch / combos_sec if combos_sec > 0 else 0.0
 
                         progress.update(
                             task_id,
                             completed=completed_in_epoch,
-                            speed=f"{combos_sec:.1f} c/s | {eff_fps:,.0f} FPS ({len(active_assignments)} GPUs)",
-                            best=f"Best: {best_acc_so_far:.2f}% (#{best_cid_so_far})"
+                            gpu_info=get_compact_gpu_summary(),
+                            best=(
+                                f"Best: {best_acc_so_far:.2f}% (#{best_cid_so_far}, >={best_thr_so_far})"
+                                if best_cid_so_far is not None else "Best: --"
+                            )
                         )
 
-                        write_live_progress(
-                            SWEEP_OUTPUT_DIR, main_pid, epoch, MAX_EPOCHS,
-                            completed_in_epoch, total_epoch_combos, len(evaluated_cache),
-                            combos_sec, eff_fps, elapsed_total, eta_sec,
-                            best_acc_so_far, best_cid_so_far, best_params_so_far
-                        )
+                        if buffer_rows:
+                            write_live_progress(
+                                SWEEP_OUTPUT_DIR, main_pid, epoch, MAX_EPOCHS,
+                                completed_in_epoch, total_epoch_combos, len(evaluated_cache),
+                                combos_sec, eff_fps, elapsed_total, eta_sec,
+                                best_acc_so_far, best_cid_so_far, best_thr_so_far, best_params_so_far
+                            )
+            else:
+                console.print(
+                    f"[bold cyan]Epoch {epoch:02d}/{MAX_EPOCHS:02d}:[/bold cyan] All {total_epoch_combos} combinations "
+                    f"already cached | [bold magenta]Best: {best_acc_so_far:.2f}% (#{best_cid_so_far}, >={best_thr_so_far})[/bold magenta]"
+                )
 
             # Update center point theta* to the best combination found
             if best_params_so_far is not None:
                 theta_star = dict(best_params_so_far)
 
-            # Step size decay: Delta <- 0.5 * Delta
+            # Smooth step size decay (0.65x per epoch) across all 10 variables
             for k, cfg in ACTIVE_VARS.items():
                 if cfg["is_int"]:
-                    current_steps[k] = max(1, int(round(current_steps[k] * 0.5)))
+                    current_steps[k] = max(1, int(round(current_steps[k] * STEP_DECAY)))
                 else:
-                    current_steps[k] = max(0.01, round(current_steps[k] * 0.5, 4))
+                    current_steps[k] = max(0.005, round(current_steps[k] * STEP_DECAY, 4))
 
-            # Check early stopping convergence
             all_at_minimum = all(
-                (current_steps[k] <= 1 if cfg["is_int"] else current_steps[k] <= 0.01)
+                (current_steps[k] <= 1 if cfg["is_int"] else current_steps[k] <= 0.005)
                 for k, cfg in ACTIVE_VARS.items()
             )
             if all_at_minimum and not improved_this_epoch:
