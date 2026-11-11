@@ -529,6 +529,49 @@ class ConsoleRedirector:
 # ==========================================
 # MAIN DESKTOP GUI
 # ==========================================
+# ==========================================
+# FONT HELPERS (Linux/X11 anti-pixelation)
+# ==========================================
+def _F(size, weight="normal"):
+    """Return a CTkFont with explicit Ubuntu/DejaVu Sans family to avoid bitmap fallback."""
+    for family in ["Ubuntu", "DejaVu Sans", "Liberation Sans", "Noto Sans", "sans-serif"]:
+        try:
+            import tkinter.font as tkfont
+            if family in tkfont.families():
+                return ctk.CTkFont(family=family, size=size, weight=weight)
+        except Exception:
+            pass
+    return ctk.CTkFont(size=size, weight=weight)
+
+def _FM(size, weight="normal"):
+    """Monospace font for timers, FPS, counters."""
+    for family in ["JetBrains Mono", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"]:
+        try:
+            import tkinter.font as tkfont
+            if family in tkfont.families():
+                return ctk.CTkFont(family=family, size=size, weight=weight)
+        except Exception:
+            pass
+    return ctk.CTkFont(size=size, weight=weight)
+
+# ==========================================
+# DESIGN TOKENS
+# ==========================================
+COLOR = {
+    "bg":          "#0b0f17",
+    "sidebar":     "#111827",
+    "card":        "#1e293b",
+    "border":      "#334155",
+    "accent_blue": "#3b82f6",
+    "accent_green":"#10b981",
+    "accent_red":  "#ef4444",
+    "accent_amber":"#f59e0b",
+    "accent_purple":"#a78bfa",
+    "muted":       "#94a3b8",
+    "text":        "#e2e8f0",
+}
+
+
 class AttendanceApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -537,12 +580,14 @@ class AttendanceApp(ctk.CTk):
         self.minsize(1360, 760)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+        self.configure(fg_color=COLOR["bg"])
         
         self.running_event = mp.Event()
         self.selected_protocol = ctk.IntVar(value=1)
         self.view_target = ctk.StringVar(value="Camera 1") 
         self.search_var = ctk.StringVar(value="")
         self.search_var.trace_add("write", lambda *args: self.refresh_roster_display(force=True))
+        self._roster_visible = True
         
         self.t_end = 0
         self.sys_fps = 0
@@ -559,6 +604,9 @@ class AttendanceApp(ctk.CTk):
         self.final_counts_map = {}
         self.is_finalized = False
         self._last_roster_signature = None
+
+        # Build full-name lookup: short_name -> full display name
+        self.full_name_map = self._load_full_name_map()
 
         # Console logging queue & redirection setup
         self.log_queue = queue.Queue()
@@ -579,6 +627,36 @@ class AttendanceApp(ctk.CTk):
         self.after(50, self.process_log_queue)
         self.log("[SYSTEM] Attendance AI Core initialized successfully.")
         self.log(f"[SYSTEM] Loaded {len(self.all_students)} enrolled students from roster.")
+        self.log(f"[SYSTEM] Full-name map loaded: {len(self.full_name_map)} entries.")
+
+    def _load_full_name_map(self):
+        """Build {short_name -> 'Full Display Name'} from name_mapping.csv + filtered_true_attendance.csv.
+        Only modifies GUI display; never touches backend short names or CSV exports."""
+        full_name_map = {}
+        try:
+            mapping_path = './name_mapping.csv'
+            attendance_path = './filtered_true_attendance.csv'
+            if os.path.exists(mapping_path) and os.path.exists(attendance_path):
+                nm = pd.read_csv(mapping_path, dtype=str).dropna(subset=['Roll_Name', 'Short_Name'])
+                nm['Roll_Name'] = nm['Roll_Name'].str.strip()
+                nm['Short_Name'] = nm['Short_Name'].str.strip()
+                fa = pd.read_csv(attendance_path, dtype=str, usecols=['Roll No', 'Student Name'])
+                fa['Roll No'] = fa['Roll No'].str.strip()
+                fa['Student Name'] = fa['Student Name'].str.strip()
+                merged = nm.merge(fa, left_on='Roll_Name', right_on='Roll No', how='left')
+                for _, row in merged.iterrows():
+                    short = row['Short_Name'].strip()
+                    full = str(row.get('Student Name', '')).strip()
+                    if short and full and full.lower() != 'nan':
+                        full_name_map[short.lower()] = full.title()
+                        full_name_map[short] = full.title()
+        except Exception as e:
+            print(f"[WARNING] Could not load full-name map: {e}")
+        return full_name_map
+
+    def _get_display_name(self, short_name):
+        """Resolve a short internal name to its full display name for GUI roster only."""
+        return self.full_name_map.get(short_name, self.full_name_map.get(short_name.lower(), short_name))
 
     def load_student_roster(self):
         if os.path.exists(META_PATH):
@@ -647,20 +725,21 @@ class AttendanceApp(ctk.CTk):
         self.destroy()
 
     def create_card(self, parent, title="", subtitle=None):
-        card = ctk.CTkFrame(parent, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
-        card.pack(fill="x", padx=4, pady=5)
+        card = ctk.CTkFrame(parent, corner_radius=10, fg_color=COLOR["card"],
+                            border_width=1, border_color=COLOR["border"])
+        card.pack(fill="x", padx=4, pady=4)
         
         if title:
             header_frame = ctk.CTkFrame(card, fg_color="transparent")
             header_frame.pack(fill="x", padx=10, pady=(8, 2))
-            
-            lbl = ctk.CTkLabel(header_frame, text=title, font=ctk.CTkFont(size=11, weight="bold"))
+            lbl = ctk.CTkLabel(header_frame, text=title, font=_F(10, "bold"),
+                               text_color=COLOR["muted"])
             lbl.pack(side="left", anchor="w")
-            
             if subtitle:
-                sub = ctk.CTkLabel(card, text=subtitle, font=ctk.CTkFont(size=10), text_color=("gray45", "gray60"))
-                sub.pack(anchor="w", padx=10, pady=(0, 4))
-                
+                sub = ctk.CTkLabel(card, text=subtitle, font=_F(10),
+                                   text_color=COLOR["muted"])
+                sub.pack(anchor="w", padx=10, pady=(0, 3))
+
         content_frame = ctk.CTkFrame(card, fg_color="transparent")
         content_frame.pack(fill="x", padx=10, pady=(2, 8))
         return content_frame
@@ -680,38 +759,67 @@ class AttendanceApp(ctk.CTk):
         if hasattr(self, 'faces_lbl'):
             self.faces_lbl.configure(text=f"{disp_faces} Detected")
 
+    def _toggle_roster_sidebar(self):
+        """Manually collapse/expand the right roster sidebar."""
+        if self._roster_visible:
+            self.roster_sidebar.pack_forget()
+            self._roster_visible = False
+            if hasattr(self, 'toggle_roster_btn'):
+                self.toggle_roster_btn.configure(text="▶ Show Roster")
+        else:
+            # Re-pack sidebar before main content
+            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0)
+            self._roster_visible = True
+            if hasattr(self, 'toggle_roster_btn'):
+                self.toggle_roster_btn.configure(text="▼ Hide Roster")
+
+    def _sync_roster_to_tracking(self):
+        """Auto-show/hide roster sidebar based on Live Tracking toggle state."""
+        tracking_on = self.global_live_tracking_var.get()
+        if tracking_on and not self._roster_visible:
+            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0)
+            self._roster_visible = True
+            if hasattr(self, 'toggle_roster_btn'):
+                self.toggle_roster_btn.configure(text="▼ Hide Roster")
+        elif not tracking_on and self._roster_visible:
+            self.roster_sidebar.pack_forget()
+            self._roster_visible = False
+            if hasattr(self, 'toggle_roster_btn'):
+                self.toggle_roster_btn.configure(text="▶ Show Roster")
+        self.update_status_indicators()
+
     def update_status_indicators(self):
         is_running = self.running_event.is_set()
         cam1_on = self.cam1_enable_var.get()
         if is_running and cam1_on:
-            self.cam1_status_dot.configure(text="●", text_color="#3fb950")
-            self.cam1_status_state.configure(text="Streaming", text_color="#3fb950")
+            self.cam1_status_dot.configure(text="●", text_color=COLOR["accent_green"])
+            self.cam1_status_state.configure(text="Streaming", text_color=COLOR["accent_green"])
         elif not cam1_on:
             self.cam1_status_dot.configure(text="●", text_color="#8b949e")
             self.cam1_status_state.configure(text="Disabled", text_color="#8b949e")
         else:
-            self.cam1_status_dot.configure(text="●", text_color="#f85149")
-            self.cam1_status_state.configure(text="Offline", text_color="#f85149")
+            self.cam1_status_dot.configure(text="●", text_color=COLOR["accent_red"])
+            self.cam1_status_state.configure(text="Offline", text_color=COLOR["accent_red"])
 
         cam2_on = self.cam2_enable_var.get()
         if is_running and cam2_on:
-            self.cam2_status_dot.configure(text="●", text_color="#3fb950")
-            self.cam2_status_state.configure(text="Streaming", text_color="#3fb950")
+            self.cam2_status_dot.configure(text="●", text_color=COLOR["accent_green"])
+            self.cam2_status_state.configure(text="Streaming", text_color=COLOR["accent_green"])
         elif not cam2_on:
             self.cam2_status_dot.configure(text="●", text_color="#8b949e")
             self.cam2_status_state.configure(text="Disabled", text_color="#8b949e")
         else:
-            self.cam2_status_dot.configure(text="●", text_color="#f85149")
-            self.cam2_status_state.configure(text="Offline", text_color="#f85149")
+            self.cam2_status_dot.configure(text="●", text_color=COLOR["accent_red"])
+            self.cam2_status_state.configure(text="Offline", text_color=COLOR["accent_red"])
 
         tracking_on = self.global_live_tracking_var.get()
         if is_running:
             if tracking_on:
-                self.ml_status_dot.configure(text="●", text_color="#3fb950")
-                self.ml_status_state.configure(text="Inferencing", text_color="#3fb950")
+                self.ml_status_dot.configure(text="●", text_color=COLOR["accent_green"])
+                self.ml_status_state.configure(text="Inferencing", text_color=COLOR["accent_green"])
             else:
-                self.ml_status_dot.configure(text="●", text_color="#d29922")
-                self.ml_status_state.configure(text="Raw Ingest", text_color="#d29922")
+                self.ml_status_dot.configure(text="●", text_color=COLOR["accent_amber"])
+                self.ml_status_state.configure(text="Raw Ingest", text_color=COLOR["accent_amber"])
         else:
             self.ml_status_dot.configure(text="●", text_color="#8b949e")
             self.ml_status_state.configure(text="Standby", text_color="#8b949e")
@@ -719,16 +827,18 @@ class AttendanceApp(ctk.CTk):
     def setup_ui(self):
         # 3-Column Master Architecture:
         # Left Sidebar (Controls) | Center Content (HUD + Video + Logs) | Right Sidebar (Live & Final Attendance Roster)
-        self.sidebar_frame = ctk.CTkFrame(self, width=350, corner_radius=0, fg_color=("#eaeef2", "#0d1117"))
+        self.sidebar_frame = ctk.CTkFrame(self, width=310, corner_radius=0, fg_color=COLOR["sidebar"])
         self.sidebar_frame.pack(side="left", fill="y", padx=0, pady=0)
         self.sidebar_frame.pack_propagate(False)
 
-        self.roster_sidebar = ctk.CTkFrame(self, width=360, corner_radius=0, fg_color=("#eaeef2", "#0d1117"))
+        # Roster sidebar starts visible (live tracking is ON by default)
+        self.roster_sidebar = ctk.CTkFrame(self, width=310, corner_radius=0, fg_color=COLOR["sidebar"])
         self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0)
         self.roster_sidebar.pack_propagate(False)
+        self._roster_visible = True
 
         self.main_content_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.main_content_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        self.main_content_frame.pack(side="left", fill="both", expand=True, padx=8, pady=8)
 
         # =============================================================
         # LEFT SIDEBAR: Controls, PTZ & System
@@ -736,11 +846,14 @@ class AttendanceApp(ctk.CTk):
         self.brand_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
         self.brand_frame.pack(fill="x", padx=14, pady=(14, 8))
 
-        ctk.CTkLabel(self.brand_frame, text="VISION SENTINEL CORE", font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(self.brand_frame, text="Dual-Camera Multiprocess AI Pipeline", font=ctk.CTkFont(size=11), text_color=("gray45", "gray60")).pack(anchor="w")
+        ctk.CTkLabel(self.brand_frame, text="VISION SENTINEL", font=_F(16, "bold"),
+                     text_color=COLOR["text"]).pack(anchor="w")
+        ctk.CTkLabel(self.brand_frame, text="Dual-Camera AI Pipeline", font=_F(10),
+                     text_color=COLOR["muted"]).pack(anchor="w")
 
         # System Status Pill Grid
-        self.status_card = ctk.CTkFrame(self.sidebar_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
+        self.status_card = ctk.CTkFrame(self.sidebar_frame, corner_radius=10,
+                                        fg_color=COLOR["card"], border_width=1, border_color=COLOR["border"])
         self.status_card.pack(fill="x", padx=10, pady=(0, 6))
 
         status_grid = ctk.CTkFrame(self.status_card, fg_color="transparent")
@@ -751,34 +864,35 @@ class AttendanceApp(ctk.CTk):
         cam1_status_box.grid(row=0, column=0, padx=2, sticky="nsew")
         cam1_dot_box = ctk.CTkFrame(cam1_status_box, fg_color="transparent")
         cam1_dot_box.pack()
-        self.cam1_status_dot = ctk.CTkLabel(cam1_dot_box, text="●", font=ctk.CTkFont(size=11), text_color="#f85149")
+        self.cam1_status_dot = ctk.CTkLabel(cam1_dot_box, text="●", font=_F(11), text_color=COLOR["accent_red"])
         self.cam1_status_dot.pack(side="left", padx=2)
-        ctk.CTkLabel(cam1_dot_box, text="Cam 1", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
-        self.cam1_status_state = ctk.CTkLabel(cam1_status_box, text="Offline", font=ctk.CTkFont(size=10), text_color="#f85149")
+        ctk.CTkLabel(cam1_dot_box, text="Cam 1", font=_F(10, "bold"), text_color=COLOR["text"]).pack(side="left")
+        self.cam1_status_state = ctk.CTkLabel(cam1_status_box, text="Offline", font=_F(10), text_color=COLOR["accent_red"])
         self.cam1_status_state.pack()
 
         cam2_status_box = ctk.CTkFrame(status_grid, corner_radius=6, fg_color="transparent")
         cam2_status_box.grid(row=0, column=1, padx=2, sticky="nsew")
         cam2_dot_box = ctk.CTkFrame(cam2_status_box, fg_color="transparent")
         cam2_dot_box.pack()
-        self.cam2_status_dot = ctk.CTkLabel(cam2_dot_box, text="●", font=ctk.CTkFont(size=11), text_color="#f85149")
+        self.cam2_status_dot = ctk.CTkLabel(cam2_dot_box, text="●", font=_F(11), text_color=COLOR["accent_red"])
         self.cam2_status_dot.pack(side="left", padx=2)
-        ctk.CTkLabel(cam2_dot_box, text="Cam 2", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
-        self.cam2_status_state = ctk.CTkLabel(cam2_status_box, text="Offline", font=ctk.CTkFont(size=10), text_color="#f85149")
+        ctk.CTkLabel(cam2_dot_box, text="Cam 2", font=_F(10, "bold"), text_color=COLOR["text"]).pack(side="left")
+        self.cam2_status_state = ctk.CTkLabel(cam2_status_box, text="Offline", font=_F(10), text_color=COLOR["accent_red"])
         self.cam2_status_state.pack()
 
         ml_status_box = ctk.CTkFrame(status_grid, corner_radius=6, fg_color="transparent")
         ml_status_box.grid(row=0, column=2, padx=2, sticky="nsew")
         ml_dot_box = ctk.CTkFrame(ml_status_box, fg_color="transparent")
         ml_dot_box.pack()
-        self.ml_status_dot = ctk.CTkLabel(ml_dot_box, text="●", font=ctk.CTkFont(size=11), text_color="#8b949e")
+        self.ml_status_dot = ctk.CTkLabel(ml_dot_box, text="●", font=_F(11), text_color="#8b949e")
         self.ml_status_dot.pack(side="left", padx=2)
-        ctk.CTkLabel(ml_dot_box, text="ML Core", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
-        self.ml_status_state = ctk.CTkLabel(ml_status_box, text="Standby", font=ctk.CTkFont(size=10), text_color="#8b949e")
+        ctk.CTkLabel(ml_dot_box, text="ML", font=_F(10, "bold"), text_color=COLOR["text"]).pack(side="left")
+        self.ml_status_state = ctk.CTkLabel(ml_status_box, text="Standby", font=_F(10), text_color="#8b949e")
         self.ml_status_state.pack()
 
         # Sidebar Tabs
-        self.tabview = ctk.CTkTabview(self.sidebar_frame, corner_radius=8)
+        self.tabview = ctk.CTkTabview(self.sidebar_frame, corner_radius=8,
+                                      fg_color=COLOR["card"], border_color=COLOR["border"], border_width=1)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
         tab_controls = self.tabview.add("Controls")
@@ -800,20 +914,23 @@ class AttendanceApp(ctk.CTk):
             card_viewport,
             values=["Camera 1", "Camera 2"],
             variable=self.view_target,
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=_F(12, "bold"),
             command=self.on_view_target_change
         )
         self.view_toggle.pack(fill="x", pady=4)
 
         card_cam_setup = self.create_card(self.controls_scroll, "CAMERA STREAMS", "Enable or disable RTSP feeds")
         self.cam1_enable_var = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(card_cam_setup, text=f"Camera 1 ({CAMERA_IP_1})", variable=self.cam1_enable_var, font=ctk.CTkFont(size=12), command=self.update_status_indicators).pack(pady=(4, 6), anchor="w")
+        ctk.CTkSwitch(card_cam_setup, text=f"Cam 1  {CAMERA_IP_1}", variable=self.cam1_enable_var,
+                      font=_F(11), command=self.update_status_indicators).pack(pady=(4, 6), anchor="w")
         self.cam2_enable_var = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(card_cam_setup, text=f"Camera 2 ({CAMERA_IP_2})", variable=self.cam2_enable_var, font=ctk.CTkFont(size=12), command=self.update_status_indicators).pack(pady=(0, 4), anchor="w")
+        ctk.CTkSwitch(card_cam_setup, text=f"Cam 2  {CAMERA_IP_2}", variable=self.cam2_enable_var,
+                      font=_F(11), command=self.update_status_indicators).pack(pady=(0, 4), anchor="w")
 
         card_ml = self.create_card(self.controls_scroll, "AI RECOGNITION ENGINE", "Real-time tracking & attendance matching")
         self.global_live_tracking_var = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(card_ml, text="Live Tracking & Face Matching", variable=self.global_live_tracking_var, font=ctk.CTkFont(size=12), command=self.update_status_indicators).pack(pady=4, anchor="w")
+        ctk.CTkSwitch(card_ml, text="Live Tracking & Face Matching", variable=self.global_live_tracking_var,
+                      font=_F(11), command=self._sync_roster_to_tracking).pack(pady=4, anchor="w")
 
         # Tab 2: PTZ & Presets
         card_proto = self.create_card(self.ptz_scroll, "EXECUTION PROTOCOL", "Preset dwell durations (Cam 1 / Cam 2)")
@@ -824,14 +941,17 @@ class AttendanceApp(ctk.CTk):
         for idx, (p, info) in enumerate(PROTOCOLS.items()):
             r, c = divmod(idx, 2)
             rb_text = f"{info['name']} ({info['cam1']}s/{info['cam2']}s)"
-            ctk.CTkRadioButton(proto_grid, text=rb_text, variable=self.selected_protocol, value=p, font=ctk.CTkFont(size=11)).grid(row=r, column=c, pady=3, padx=2, sticky="w")
+            ctk.CTkRadioButton(proto_grid, text=rb_text, variable=self.selected_protocol, value=p,
+                               font=_F(10)).grid(row=r, column=c, pady=3, padx=2, sticky="w")
 
         card_presets = self.create_card(self.ptz_scroll, "CAMERA PRESETS", "Active tour waypoints")
         cam1_header = ctk.CTkFrame(card_presets, fg_color="transparent")
         cam1_header.pack(fill="x", pady=(2, 2))
-        ctk.CTkLabel(cam1_header, text="Cam 1 (1-8):", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
-        ctk.CTkButton(cam1_header, text="All", width=34, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(1, True)).pack(side="right", padx=(2, 0))
-        ctk.CTkButton(cam1_header, text="None", width=38, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(1, False)).pack(side="right")
+        ctk.CTkLabel(cam1_header, text="Cam 1 (1-8):", font=_F(10, "bold"), text_color=COLOR["text"]).pack(side="left")
+        ctk.CTkButton(cam1_header, text="All", width=34, height=18, font=_F(10),
+                      command=lambda: self.toggle_all_presets(1, True)).pack(side="right", padx=(2, 0))
+        ctk.CTkButton(cam1_header, text="None", width=38, height=18, font=_F(10),
+                      command=lambda: self.toggle_all_presets(1, False)).pack(side="right")
 
         self.preset_frame1 = ctk.CTkFrame(card_presets, fg_color="transparent")
         self.preset_frame1.pack(fill="x", pady=(2, 4))
@@ -840,13 +960,16 @@ class AttendanceApp(ctk.CTk):
         for idx, p in enumerate(CAM1_PRESETS):
             var = ctk.BooleanVar(value=True)
             self.cam1_preset_vars[p] = var
-            ctk.CTkCheckBox(self.preset_frame1, text=f"P{p}", variable=var, font=ctk.CTkFont(size=11), width=45).grid(row=idx // 4, column=idx % 4, padx=2, pady=3, sticky="w")
+            ctk.CTkCheckBox(self.preset_frame1, text=f"P{p}", variable=var, font=_F(10), width=45
+                            ).grid(row=idx // 4, column=idx % 4, padx=2, pady=3, sticky="w")
 
         cam2_header = ctk.CTkFrame(card_presets, fg_color="transparent")
         cam2_header.pack(fill="x", pady=(4, 2))
-        ctk.CTkLabel(cam2_header, text="Cam 2 (1-6):", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
-        ctk.CTkButton(cam2_header, text="All", width=34, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(2, True)).pack(side="right", padx=(2, 0))
-        ctk.CTkButton(cam2_header, text="None", width=38, height=20, font=ctk.CTkFont(size=10), command=lambda: self.toggle_all_presets(2, False)).pack(side="right")
+        ctk.CTkLabel(cam2_header, text="Cam 2 (1-6):", font=_F(10, "bold"), text_color=COLOR["text"]).pack(side="left")
+        ctk.CTkButton(cam2_header, text="All", width=34, height=18, font=_F(10),
+                      command=lambda: self.toggle_all_presets(2, True)).pack(side="right", padx=(2, 0))
+        ctk.CTkButton(cam2_header, text="None", width=38, height=18, font=_F(10),
+                      command=lambda: self.toggle_all_presets(2, False)).pack(side="right")
 
         self.preset_frame2 = ctk.CTkFrame(card_presets, fg_color="transparent")
         self.preset_frame2.pack(fill="x", pady=(2, 4))
@@ -855,21 +978,23 @@ class AttendanceApp(ctk.CTk):
         for idx, p in enumerate(CAM2_PRESETS):
             var = ctk.BooleanVar(value=True)
             self.cam2_preset_vars[p] = var
-            ctk.CTkCheckBox(self.preset_frame2, text=f"P{p}", variable=var, font=ctk.CTkFont(size=11), width=45).grid(row=idx // 3, column=idx % 3, padx=2, pady=3, sticky="w")
+            ctk.CTkCheckBox(self.preset_frame2, text=f"P{p}", variable=var, font=_F(10), width=45
+                            ).grid(row=idx // 3, column=idx % 3, padx=2, pady=3, sticky="w")
 
         card_ptz = self.create_card(self.ptz_scroll, "MANUAL PTZ", "Hold to move, release to stop")
-        self.ptz_target_lbl = ctk.CTkLabel(card_ptz, text=f"Directing: {self.view_target.get()}", font=ctk.CTkFont(size=11, weight="bold"), text_color="#58a6ff")
+        self.ptz_target_lbl = ctk.CTkLabel(card_ptz, text=f"Directing: {self.view_target.get()}",
+                                           font=_F(10, "bold"), text_color=COLOR["accent_blue"])
         self.ptz_target_lbl.pack(anchor="w", pady=(0, 4))
 
         dpad_container = ctk.CTkFrame(card_ptz, corner_radius=8, fg_color="transparent")
         dpad_container.pack(fill="x", pady=(0, 6))
         dpad_container.grid_columnconfigure((0, 1, 2), weight=1)
 
-        btn_up = ctk.CTkButton(dpad_container, text="▲", height=28, font=ctk.CTkFont(size=14, weight="bold"))
-        btn_left = ctk.CTkButton(dpad_container, text="◀", height=28, font=ctk.CTkFont(size=14, weight="bold"))
-        btn_center = ctk.CTkButton(dpad_container, text="PTZ", height=28, font=ctk.CTkFont(size=10, weight="bold"), state="disabled")
-        btn_right = ctk.CTkButton(dpad_container, text="▶", height=28, font=ctk.CTkFont(size=14, weight="bold"))
-        btn_down = ctk.CTkButton(dpad_container, text="▼", height=28, font=ctk.CTkFont(size=14, weight="bold"))
+        btn_up = ctk.CTkButton(dpad_container, text="▲", height=28, font=_F(13, "bold"))
+        btn_left = ctk.CTkButton(dpad_container, text="◀", height=28, font=_F(13, "bold"))
+        btn_center = ctk.CTkButton(dpad_container, text="PTZ", height=28, font=_F(10, "bold"), state="disabled")
+        btn_right = ctk.CTkButton(dpad_container, text="▶", height=28, font=_F(13, "bold"))
+        btn_down = ctk.CTkButton(dpad_container, text="▼", height=28, font=_F(13, "bold"))
 
         btn_up.grid(row=0, column=1, padx=3, pady=2, sticky="nsew")
         btn_left.grid(row=1, column=0, padx=3, pady=2, sticky="nsew")
@@ -881,13 +1006,13 @@ class AttendanceApp(ctk.CTk):
         lens_container.pack(fill="x")
         lens_container.grid_columnconfigure((0, 1), weight=1)
 
-        btn_zi = ctk.CTkButton(lens_container, text="+ Zoom In", height=26, font=ctk.CTkFont(size=11))
-        btn_zo = ctk.CTkButton(lens_container, text="- Zoom Out", height=26, font=ctk.CTkFont(size=11))
+        btn_zi = ctk.CTkButton(lens_container, text="+ Zoom In", height=26, font=_F(10))
+        btn_zo = ctk.CTkButton(lens_container, text="- Zoom Out", height=26, font=_F(10))
         btn_zi.grid(row=0, column=0, padx=3, pady=2, sticky="nsew")
         btn_zo.grid(row=0, column=1, padx=3, pady=2, sticky="nsew")
 
-        btn_fi = ctk.CTkButton(lens_container, text="+ Focus Near", height=26, font=ctk.CTkFont(size=11))
-        btn_fo = ctk.CTkButton(lens_container, text="- Focus Far", height=26, font=ctk.CTkFont(size=11))
+        btn_fi = ctk.CTkButton(lens_container, text="+ Focus Near", height=26, font=_F(10))
+        btn_fo = ctk.CTkButton(lens_container, text="- Focus Far", height=26, font=_F(10))
         btn_fi.grid(row=1, column=0, padx=3, pady=2, sticky="nsew")
         btn_fo.grid(row=1, column=1, padx=3, pady=2, sticky="nsew")
 
@@ -904,7 +1029,8 @@ class AttendanceApp(ctk.CTk):
 
         # Tab 3: System
         card_sys_ui = self.create_card(self.system_scroll, "INTERFACE PREFERENCES")
-        theme_selector = ctk.CTkSegmentedButton(card_sys_ui, values=["Dark", "Light", "System"], font=ctk.CTkFont(size=11), command=lambda mode: ctk.set_appearance_mode(mode.lower()))
+        theme_selector = ctk.CTkSegmentedButton(card_sys_ui, values=["Dark", "Light", "System"],
+                                                font=_F(10), command=lambda mode: ctk.set_appearance_mode(mode.lower()))
         theme_selector.set("Dark")
         theme_selector.pack(fill="x", pady=4)
 
@@ -915,12 +1041,12 @@ class AttendanceApp(ctk.CTk):
         self.start_btn = ctk.CTkButton(
             self.cta_frame,
             text="▶  START LIVE TRACKING",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=_F(13, "bold"),
             height=42,
-            fg_color="#238636",
-            hover_color="#2ea043",
+            fg_color=COLOR["accent_green"],
+            hover_color="#059669",
             text_color="#ffffff",
-            corner_radius=8,
+            corner_radius=10,
             command=self.start_tracking
         )
         self.start_btn.pack(fill="x", pady=(0, 6))
@@ -928,14 +1054,14 @@ class AttendanceApp(ctk.CTk):
         self.stop_btn = ctk.CTkButton(
             self.cta_frame,
             text="■  STOP & FINALIZE ROSTER",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=_F(11, "bold"),
             height=36,
             fg_color="transparent",
             border_width=2,
-            border_color="#da3633",
-            hover_color="#b62324",
-            text_color="#da3633",
-            corner_radius=8,
+            border_color=COLOR["accent_red"],
+            hover_color="#b91c1c",
+            text_color=COLOR["accent_red"],
+            corner_radius=10,
             command=self.stop_tracking
         )
         self.stop_btn.pack(fill="x")
@@ -944,59 +1070,71 @@ class AttendanceApp(ctk.CTk):
         # =============================================================
         # CENTER PANEL: Telemetry HUD + Video Feed + Console Logs
         # =============================================================
-        self.hud_frame = ctk.CTkFrame(self.main_content_frame, corner_radius=8, fg_color="transparent")
-        self.hud_frame.pack(fill="x", padx=0, pady=(0, 8))
-        self.hud_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        # HUD bar: 4 tiles + toggle roster button on far right
+        hud_outer = ctk.CTkFrame(self.main_content_frame, fg_color="transparent")
+        hud_outer.pack(fill="x", padx=0, pady=(0, 6))
+        hud_outer.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        hud_outer.grid_columnconfigure(4, weight=0)
 
-        tile0 = ctk.CTkFrame(self.hud_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
-        tile0.grid(row=0, column=0, padx=(0, 4), pady=2, sticky="nsew")
-        ctk.CTkLabel(tile0, text="REMAINING TIME", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(pady=(6, 0), padx=10, anchor="w")
-        self.time_lbl = ctk.CTkLabel(tile0, text="00:00:00", font=ctk.CTkFont(size=19, weight="bold"), text_color="#58a6ff")
-        self.time_lbl.pack(pady=(0, 6), padx=10, anchor="w")
+        self.hud_frame = hud_outer
 
-        tile1 = ctk.CTkFrame(self.hud_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
-        tile1.grid(row=0, column=1, padx=4, pady=2, sticky="nsew")
-        ctk.CTkLabel(tile1, text="RENDER SPEED", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(pady=(6, 0), padx=10, anchor="w")
-        self.fps_lbl = ctk.CTkLabel(tile1, text="0.0 FPS", font=ctk.CTkFont(size=19, weight="bold"), text_color="#3fb950")
-        self.fps_lbl.pack(pady=(0, 6), padx=10, anchor="w")
+        def _hud_tile(col, label_text, value_text, value_color, padx=(0, 4)):
+            t = ctk.CTkFrame(hud_outer, corner_radius=10, fg_color=COLOR["card"],
+                             border_width=1, border_color=COLOR["border"])
+            t.grid(row=0, column=col, padx=padx, pady=0, sticky="nsew")
+            ctk.CTkLabel(t, text=label_text, font=_F(9, "bold"),
+                         text_color=COLOR["muted"]).pack(pady=(7, 0), padx=10, anchor="w")
+            lbl = ctk.CTkLabel(t, text=value_text, font=_FM(18, "bold"), text_color=value_color)
+            lbl.pack(pady=(0, 7), padx=10, anchor="w")
+            return lbl
 
-        tile2 = ctk.CTkFrame(self.hud_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
-        tile2.grid(row=0, column=2, padx=4, pady=2, sticky="nsew")
-        ctk.CTkLabel(tile2, text="ACTIVE FACES IN VIEW", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(pady=(6, 0), padx=10, anchor="w")
-        self.faces_lbl = ctk.CTkLabel(tile2, text="0 Detected", font=ctk.CTkFont(size=19, weight="bold"), text_color="#d29922")
-        self.faces_lbl.pack(pady=(0, 6), padx=10, anchor="w")
+        self.time_lbl   = _hud_tile(0, "REMAINING TIME",      "00:00:00",   COLOR["accent_blue"],  padx=(0, 3))
+        self.fps_lbl    = _hud_tile(1, "RENDER SPEED",        "0.0 FPS",    COLOR["accent_green"], padx=(3, 3))
+        self.faces_lbl  = _hud_tile(2, "ACTIVE FACES IN VIEW","0 Detected", COLOR["accent_amber"], padx=(3, 3))
+        self.active_stream_lbl = _hud_tile(3, "ACTIVE CAMERA","Camera 1",   COLOR["accent_purple"],padx=(3, 3))
 
-        tile3 = ctk.CTkFrame(self.hud_frame, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
-        tile3.grid(row=0, column=3, padx=(4, 0), pady=2, sticky="nsew")
-        ctk.CTkLabel(tile3, text="ACTIVE CAMERA", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(pady=(6, 0), padx=10, anchor="w")
-        self.active_stream_lbl = ctk.CTkLabel(tile3, text="Camera 1", font=ctk.CTkFont(size=19, weight="bold"), text_color="#bc8cff")
-        self.active_stream_lbl.pack(pady=(0, 6), padx=10, anchor="w")
+        # Toggle-roster button tile
+        toggle_tile = ctk.CTkFrame(hud_outer, corner_radius=10, fg_color=COLOR["card"],
+                                   border_width=1, border_color=COLOR["border"])
+        toggle_tile.grid(row=0, column=4, padx=(3, 0), pady=0, sticky="nsew")
+        self.toggle_roster_btn = ctk.CTkButton(
+            toggle_tile, text="▼ Hide Roster", font=_F(9, "bold"),
+            width=90, height=28, corner_radius=6,
+            fg_color=COLOR["border"], hover_color=COLOR["card"],
+            text_color=COLOR["muted"], command=self._toggle_roster_sidebar
+        )
+        self.toggle_roster_btn.pack(expand=True)
 
         # Video Viewport
-        self.video_container = ctk.CTkFrame(self.main_content_frame, corner_radius=8, fg_color="#000000", border_width=1, border_color=("#d0d7de", "#30363d"))
-        self.video_container.pack(fill="both", expand=True, padx=0, pady=(0, 8))
+        self.video_container = ctk.CTkFrame(self.main_content_frame, corner_radius=10,
+                                            fg_color="#000000", border_width=1, border_color=COLOR["border"])
+        self.video_container.pack(fill="both", expand=True, padx=0, pady=(0, 6))
 
         self.video_frame = ctk.CTkLabel(
             self.video_container,
-            text="Camera Feed Standby\n\nClick 'Start Live Tracking' to begin classroom attendance monitoring",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=("gray50", "gray65"),
+            text="Camera Feed Standby\n\nClick  ▶ START LIVE TRACKING  to begin classroom attendance monitoring",
+            font=_F(13, "bold"),
+            text_color=COLOR["muted"],
             fg_color="black"
         )
         self.video_frame.pack(fill="both", expand=True, padx=2, pady=2)
 
         # Bottom Console Logs
-        self.log_container = ctk.CTkFrame(self.main_content_frame, corner_radius=8, height=130, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
+        self.log_container = ctk.CTkFrame(self.main_content_frame, corner_radius=10, height=120,
+                                          fg_color=COLOR["card"], border_width=1, border_color=COLOR["border"])
         self.log_container.pack(fill="x", padx=0, pady=0)
         self.log_container.pack_propagate(False)
 
         log_header = ctk.CTkFrame(self.log_container, fg_color="transparent")
         log_header.pack(fill="x", padx=10, pady=(5, 2))
-        ctk.CTkLabel(log_header, text="SYSTEM PIPELINE CONSOLE", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(side="left")
-        ctk.CTkButton(log_header, text="Clear", width=55, height=20, font=ctk.CTkFont(size=10), command=self.clear_logs).pack(side="right", padx=(6, 0))
-        ctk.CTkCheckBox(log_header, text="Auto-scroll", variable=self.autoscroll_var, font=ctk.CTkFont(size=10), checkbox_width=14, checkbox_height=14).pack(side="right", padx=6)
+        ctk.CTkLabel(log_header, text="SYSTEM PIPELINE CONSOLE", font=_F(9, "bold"),
+                     text_color=COLOR["muted"]).pack(side="left")
+        ctk.CTkButton(log_header, text="Clear", width=50, height=18, font=_F(9),
+                      command=self.clear_logs).pack(side="right", padx=(6, 0))
+        ctk.CTkCheckBox(log_header, text="Auto-scroll", variable=self.autoscroll_var,
+                        font=_F(9), checkbox_width=13, checkbox_height=13).pack(side="right", padx=6)
 
-        self.log_textbox = ctk.CTkTextbox(self.log_container, font=ctk.CTkFont(size=11), wrap="word", corner_radius=6)
+        self.log_textbox = ctk.CTkTextbox(self.log_container, font=_FM(10), wrap="word", corner_radius=6)
         self.log_textbox.pack(fill="both", expand=True, padx=8, pady=(0, 6))
         self.log_textbox.configure(state="disabled")
 
@@ -1004,81 +1142,78 @@ class AttendanceApp(ctk.CTk):
         # RIGHT SIDEBAR: CLASS ATTENDANCE ROSTER (ABSENT FIRST, THEN PRESENT)
         # =============================================================
         roster_header = ctk.CTkFrame(self.roster_sidebar, fg_color="transparent")
-        roster_header.pack(fill="x", padx=14, pady=(14, 6))
+        roster_header.pack(fill="x", padx=12, pady=(12, 4))
 
         title_row = ctk.CTkFrame(roster_header, fg_color="transparent")
         title_row.pack(fill="x")
-        ctk.CTkLabel(title_row, text="CLASS ATTENDANCE", font=ctk.CTkFont(size=16, weight="bold")).pack(side="left")
+        ctk.CTkLabel(title_row, text="CLASS ATTENDANCE", font=_F(14, "bold"),
+                     text_color=COLOR["text"]).pack(side="left")
 
         self.roster_mode_badge = ctk.CTkLabel(
-            title_row,
-            text="STANDBY",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color=("#d0d7de", "#30363d"),
-            text_color=("#24292f", "#c9d1d9"),
-            corner_radius=6,
-            padx=8,
-            pady=2
+            title_row, text="STANDBY", font=_F(9, "bold"),
+            fg_color=COLOR["border"], text_color=COLOR["muted"],
+            corner_radius=6, padx=7, pady=2
         )
         self.roster_mode_badge.pack(side="right")
 
-        # Summary Counter Banner (Present / Total & Absent Count)
-        self.summary_card = ctk.CTkFrame(self.roster_sidebar, corner_radius=8, fg_color=("#f6f8fa", "#161b22"), border_width=1, border_color=("#d0d7de", "#30363d"))
-        self.summary_card.pack(fill="x", padx=12, pady=(2, 8))
+        # Summary Counter Banner
+        self.summary_card = ctk.CTkFrame(self.roster_sidebar, corner_radius=10,
+                                         fg_color=COLOR["card"], border_width=1, border_color=COLOR["border"])
+        self.summary_card.pack(fill="x", padx=10, pady=(2, 6))
 
         count_top = ctk.CTkFrame(self.summary_card, fg_color="transparent")
-        count_top.pack(fill="x", padx=12, pady=(8, 4))
-        ctk.CTkLabel(count_top, text="PRESENT IN CLASS", font=ctk.CTkFont(size=10, weight="bold"), text_color=("gray45", "gray60")).pack(side="left")
-        self.attendance_pct_lbl = ctk.CTkLabel(count_top, text="0.0%", font=ctk.CTkFont(size=11, weight="bold"), text_color="#3fb950")
+        count_top.pack(fill="x", padx=10, pady=(8, 2))
+        ctk.CTkLabel(count_top, text="PRESENT IN CLASS", font=_F(9, "bold"),
+                     text_color=COLOR["muted"]).pack(side="left")
+        self.attendance_pct_lbl = ctk.CTkLabel(count_top, text="0.0%", font=_F(10, "bold"),
+                                               text_color=COLOR["accent_green"])
         self.attendance_pct_lbl.pack(side="right")
 
         self.present_Big_lbl = ctk.CTkLabel(
-            self.summary_card,
-            text=f"0 / {len(self.all_students)} Students",
-            font=ctk.CTkFont(size=22, weight="bold"),
-            text_color="#3fb950"
+            self.summary_card, text=f"0 / {len(self.all_students)} Students",
+            font=_FM(18, "bold"), text_color=COLOR["accent_green"]
         )
-        self.present_Big_lbl.pack(anchor="w", padx=12, pady=(0, 6))
+        self.present_Big_lbl.pack(anchor="w", padx=10, pady=(0, 4))
 
-        self.attendance_progress = ctk.CTkProgressBar(self.summary_card, height=8, corner_radius=4, progress_color="#3fb950")
-        self.attendance_progress.pack(fill="x", padx=12, pady=(0, 8))
+        self.attendance_progress = ctk.CTkProgressBar(self.summary_card, height=6, corner_radius=3,
+                                                      progress_color=COLOR["accent_green"])
+        self.attendance_progress.pack(fill="x", padx=10, pady=(0, 6))
         self.attendance_progress.set(0)
 
         pills_row = ctk.CTkFrame(self.summary_card, fg_color="transparent")
-        pills_row.pack(fill="x", padx=12, pady=(0, 8))
+        pills_row.pack(fill="x", padx=10, pady=(0, 6))
         pills_row.grid_columnconfigure((0, 1), weight=1)
 
-        abs_pill = ctk.CTkFrame(pills_row, corner_radius=6, fg_color=("#ffebe9", "#2d1519"), border_width=1, border_color="#f85149")
-        abs_pill.grid(row=0, column=0, padx=(0, 4), sticky="nsew")
-        self.absent_count_lbl = ctk.CTkLabel(abs_pill, text=f"Absent: {len(self.all_students)}", font=ctk.CTkFont(size=11, weight="bold"), text_color="#f85149")
-        self.absent_count_lbl.pack(pady=4)
+        abs_pill = ctk.CTkFrame(pills_row, corner_radius=6, fg_color="#1e1218",
+                                border_width=1, border_color=COLOR["accent_red"])
+        abs_pill.grid(row=0, column=0, padx=(0, 3), sticky="nsew")
+        self.absent_count_lbl = ctk.CTkLabel(abs_pill, text=f"Absent: {len(self.all_students)}",
+                                             font=_F(10, "bold"), text_color=COLOR["accent_red"])
+        self.absent_count_lbl.pack(pady=3)
 
-        pres_pill = ctk.CTkFrame(pills_row, corner_radius=6, fg_color=("#dafbe1", "#12261e"), border_width=1, border_color="#3fb950")
-        pres_pill.grid(row=0, column=1, padx=(4, 0), sticky="nsew")
-        self.present_count_lbl = ctk.CTkLabel(pres_pill, text="Present: 0", font=ctk.CTkFont(size=11, weight="bold"), text_color="#3fb950")
-        self.present_count_lbl.pack(pady=4)
+        pres_pill = ctk.CTkFrame(pills_row, corner_radius=6, fg_color="#0d1f18",
+                                 border_width=1, border_color=COLOR["accent_green"])
+        pres_pill.grid(row=0, column=1, padx=(3, 0), sticky="nsew")
+        self.present_count_lbl = ctk.CTkLabel(pres_pill, text="Present: 0",
+                                              font=_F(10, "bold"), text_color=COLOR["accent_green"])
+        self.present_count_lbl.pack(pady=3)
 
         # Search Filter
         search_frame = ctk.CTkFrame(self.roster_sidebar, fg_color="transparent")
-        search_frame.pack(fill="x", padx=12, pady=(0, 6))
+        search_frame.pack(fill="x", padx=10, pady=(0, 4))
         self.search_entry = ctk.CTkEntry(
-            search_frame,
-            placeholder_text="Search student name...",
-            textvariable=self.search_var,
-            height=30,
-            font=ctk.CTkFont(size=12)
+            search_frame, placeholder_text="Search by name...",
+            textvariable=self.search_var, height=28, font=_F(11),
+            fg_color=COLOR["card"], border_color=COLOR["border"], border_width=1
         )
         self.search_entry.pack(fill="x")
 
         # Unified Scrollable List: ABSENT FIRST, then PRESENT
         self.roster_scroll = ctk.CTkScrollableFrame(
-            self.roster_sidebar,
-            corner_radius=8,
-            fg_color=("#f6f8fa", "#161b22"),
-            border_width=1,
-            border_color=("#d0d7de", "#30363d")
+            self.roster_sidebar, corner_radius=8,
+            fg_color=COLOR["card"], border_width=1, border_color=COLOR["border"]
         )
-        self.roster_scroll.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.roster_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         self.update_status_indicators()
 
@@ -1086,6 +1221,7 @@ class AttendanceApp(ctk.CTk):
         """
         Renders the Attendance Sidebar with ALL ABSENT students first,
         followed by ALL PRESENT students, and updates total class counts.
+        Uses self.full_name_map for GUI display only; internal names unchanged.
         """
         if not self.all_students:
             self.all_students = self.load_student_roster()
@@ -1103,10 +1239,10 @@ class AttendanceApp(ctk.CTk):
 
         total_count = len(self.all_students)
         present_all = sorted([s for s in self.all_students if s in present_set])
-        absent_all = sorted([s for s in self.all_students if s not in present_set])
+        absent_all  = sorted([s for s in self.all_students if s not in present_set])
 
         present_count = len(present_all)
-        absent_count = len(absent_all)
+        absent_count  = len(absent_all)
         pct = (present_count / total_count * 100.0) if total_count > 0 else 0.0
 
         # Update Top Summary Card
@@ -1116,57 +1252,62 @@ class AttendanceApp(ctk.CTk):
         self.absent_count_lbl.configure(text=f"Absent: {absent_count}")
         self.present_count_lbl.configure(text=f"Present: {present_count}")
 
-        # Filter by search query if typed
-        absent_filtered = [s for s in absent_all if query in s.lower()] if query else absent_all
-        present_filtered = [s for s in present_all if query in s.lower()] if query else present_all
+        # Filter by search query — match against BOTH short name AND full display name
+        def _matches(s):
+            if not query:
+                return True
+            dn = self._get_display_name(s).lower()
+            return query in s.lower() or query in dn
+
+        absent_filtered  = [s for s in absent_all  if _matches(s)]
+        present_filtered = [s for s in present_all if _matches(s)]
 
         # Clear existing items
         for child in self.roster_scroll.winfo_children():
             child.destroy()
 
         # 1. ABSENT SECTION HEADER (Shown First)
-        abs_header = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color=("#ffebe9", "#2d1519"))
-        abs_header.pack(fill="x", padx=2, pady=(2, 4))
-        ctk.CTkLabel(
-            abs_header,
-            text=f"ABSENT ({len(absent_filtered)})",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#f85149"
-        ).pack(side="left", padx=8, pady=4)
+        abs_header = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color="#1e1218")
+        abs_header.pack(fill="x", padx=2, pady=(2, 3))
+        ctk.CTkLabel(abs_header, text=f"ABSENT  ({len(absent_filtered)})",
+                     font=_F(10, "bold"), text_color=COLOR["accent_red"]).pack(side="left", padx=8, pady=4)
 
         if absent_filtered:
-            for idx, name in enumerate(absent_filtered, 1):
+            for idx, s in enumerate(absent_filtered, 1):
+                display_name = self._get_display_name(s)
                 row = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color="transparent")
                 row.pack(fill="x", padx=2, pady=1)
-                ctk.CTkLabel(row, text="●", font=ctk.CTkFont(size=10), text_color="#f85149").pack(side="left", padx=(6, 4))
-                ctk.CTkLabel(row, text=f"{idx}. {name}", font=ctk.CTkFont(size=12), anchor="w").pack(side="left", fill="x", expand=True)
-                ctk.CTkLabel(row, text="ABSENT", font=ctk.CTkFont(size=9, weight="bold"), text_color="#f85149").pack(side="right", padx=6)
+                ctk.CTkLabel(row, text="●", font=_F(9), text_color=COLOR["accent_red"]).pack(side="left", padx=(6, 3))
+                ctk.CTkLabel(row, text=f"{idx}. {display_name}", font=_F(11), anchor="w",
+                             text_color=COLOR["text"]).pack(side="left", fill="x", expand=True)
+                ctk.CTkLabel(row, text="ABSENT", font=_F(8, "bold"),
+                             text_color=COLOR["accent_red"]).pack(side="right", padx=5)
         else:
-            ctk.CTkLabel(self.roster_scroll, text="No absent students!", font=ctk.CTkFont(size=11), text_color=("gray45", "gray60")).pack(pady=6)
+            ctk.CTkLabel(self.roster_scroll, text="All students present!", font=_F(10),
+                         text_color=COLOR["accent_green"]).pack(pady=6)
 
         # 2. PRESENT SECTION HEADER (Shown Second)
-        pres_header = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color=("#dafbe1", "#12261e"))
-        pres_header.pack(fill="x", padx=2, pady=(10, 4))
-        ctk.CTkLabel(
-            pres_header,
-            text=f"PRESENT ({len(present_filtered)})",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#3fb950"
-        ).pack(side="left", padx=8, pady=4)
+        pres_header = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color="#0d1f18")
+        pres_header.pack(fill="x", padx=2, pady=(8, 3))
+        ctk.CTkLabel(pres_header, text=f"PRESENT  ({len(present_filtered)})",
+                     font=_F(10, "bold"), text_color=COLOR["accent_green"]).pack(side="left", padx=8, pady=4)
 
         if present_filtered:
-            for idx, name in enumerate(present_filtered, 1):
+            for idx, s in enumerate(present_filtered, 1):
+                display_name = self._get_display_name(s)
                 row = ctk.CTkFrame(self.roster_scroll, corner_radius=6, fg_color="transparent")
                 row.pack(fill="x", padx=2, pady=1)
-                ctk.CTkLabel(row, text="●", font=ctk.CTkFont(size=10), text_color="#3fb950").pack(side="left", padx=(6, 4))
-                ctk.CTkLabel(row, text=f"{idx}. {name}", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(side="left", fill="x", expand=True)
-                
+                ctk.CTkLabel(row, text="●", font=_F(9), text_color=COLOR["accent_green"]).pack(side="left", padx=(6, 3))
+                ctk.CTkLabel(row, text=f"{idx}. {display_name}", font=_F(11, "bold"), anchor="w",
+                             text_color=COLOR["text"]).pack(side="left", fill="x", expand=True)
                 badge_text = "VERIFIED" if self.is_finalized else "LIVE"
-                if self.is_finalized and name in self.final_counts_map and self.final_counts_map[name] > 0:
-                    badge_text = f"VERIFIED ({self.final_counts_map[name]})"
-                ctk.CTkLabel(row, text=badge_text, font=ctk.CTkFont(size=9, weight="bold"), text_color="#3fb950").pack(side="right", padx=6)
+                if self.is_finalized and s in self.final_counts_map and self.final_counts_map[s] > 0:
+                    badge_text = f"✓ {self.final_counts_map[s]}"
+                ctk.CTkLabel(row, text=badge_text, font=_F(8, "bold"),
+                             text_color=COLOR["accent_green"]).pack(side="right", padx=5)
         else:
-            ctk.CTkLabel(self.roster_scroll, text="No students marked present yet", font=ctk.CTkFont(size=11), text_color=("gray45", "gray60")).pack(pady=6)
+            ctk.CTkLabel(self.roster_scroll, text="No students marked present yet", font=_F(10),
+                         text_color=COLOR["muted"]).pack(pady=6)
 
     def start_tracking(self):
         if self.running_event.is_set(): return
@@ -1181,7 +1322,7 @@ class AttendanceApp(ctk.CTk):
         self.final_presence_map.clear()
         self.final_counts_map.clear()
         self.is_finalized = False
-        self.roster_mode_badge.configure(text="LIVE TRACKING", fg_color="#1f6feb", text_color="#ffffff")
+        self.roster_mode_badge.configure(text="LIVE TRACKING", fg_color=COLOR["accent_blue"], text_color="#ffffff")
         self.refresh_roster_display(force=True)
 
         sel = self.selected_protocol.get()
