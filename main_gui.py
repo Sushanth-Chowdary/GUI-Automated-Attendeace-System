@@ -767,8 +767,8 @@ class AttendanceApp(ctk.CTk):
             if hasattr(self, 'toggle_roster_btn'):
                 self.toggle_roster_btn.configure(text="▶ Show Roster")
         else:
-            # Re-pack sidebar before main content
-            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0)
+            # Re-pack sidebar before main content so center expands/shrinks properly
+            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0, before=self.main_content_frame)
             self._roster_visible = True
             if hasattr(self, 'toggle_roster_btn'):
                 self.toggle_roster_btn.configure(text="▼ Hide Roster")
@@ -777,7 +777,7 @@ class AttendanceApp(ctk.CTk):
         """Auto-show/hide roster sidebar based on Live Tracking toggle state."""
         tracking_on = self.global_live_tracking_var.get()
         if tracking_on and not self._roster_visible:
-            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0)
+            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0, before=self.main_content_frame)
             self._roster_visible = True
             if hasattr(self, 'toggle_roster_btn'):
                 self.toggle_roster_btn.configure(text="▼ Hide Roster")

@@ -964,21 +964,23 @@ class AttendanceApp(ctk.CTk):
             self.faces_lbl.configure(text=f"{disp_faces} Detected")
 
     def _toggle_roster_sidebar(self):
+        """Manually collapse/expand the right roster sidebar."""
         if self._roster_visible:
             self.roster_sidebar.pack_forget()
             self._roster_visible = False
             if hasattr(self, 'toggle_roster_btn'):
                 self.toggle_roster_btn.configure(text="▶ Show Roster")
         else:
-            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0)
+            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0, before=self.main_content_frame)
             self._roster_visible = True
             if hasattr(self, 'toggle_roster_btn'):
                 self.toggle_roster_btn.configure(text="▼ Hide Roster")
 
     def _sync_roster_to_tracking(self):
+        """Auto-show/hide roster sidebar based on Live Tracking toggle state."""
         tracking_on = self.global_live_tracking_var.get()
         if tracking_on and not self._roster_visible:
-            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0)
+            self.roster_sidebar.pack(side="right", fill="y", padx=0, pady=0, before=self.main_content_frame)
             self._roster_visible = True
             if hasattr(self, 'toggle_roster_btn'):
                 self.toggle_roster_btn.configure(text="▼ Hide Roster")
